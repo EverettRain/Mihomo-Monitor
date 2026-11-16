@@ -16,6 +16,8 @@ module.exports = {
         faint: token("faint"),
         brand: { DEFAULT: token("brand"), soft: token("brand-soft"), fg: token("brand-fg") },
         accent: token("accent"),
+        down: token("down"),
+        up: token("up"),
         ok: { DEFAULT: token("ok"), soft: token("ok-soft") },
         danger: { DEFAULT: token("danger"), soft: token("danger-soft") },
         warn: { DEFAULT: token("warn"), soft: token("warn-soft") },
