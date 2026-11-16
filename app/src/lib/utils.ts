@@ -19,18 +19,21 @@ export function bytes(n: number): string {
   return `${v >= 100 ? v.toFixed(0) : v.toFixed(2)} ${UNITS[i]}`;
 }
 
+/** Three significant digits, for secondary figures in tight spaces: 17.4 GB, 1.13 GB, 638 GB. */
+export function bytesShort(n: number): string {
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < UNITS.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  if (i === 0) return `${Math.round(v)} B`;
+  return `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${UNITS[i]}`;
+}
+
 /** A per-second rate. */
 export function rate(n: number): string {
   return `${bytes(n)}/s`;
-}
-
-/**
- * Splits a size into number and unit, for figures that set the unit smaller. Rounded to fewer
- * digits than `bytes`, as an axis or headline wants.
- */
-export function bytesParts(n: number): [string, string] {
-  const [v, u] = bytes(n).split(" ");
-  return [v, u];
 }
 
 /** A clean axis top: 1, 2 or 5 × a power of 1024-based unit steps rounded in that unit. */

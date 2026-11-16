@@ -158,9 +158,11 @@ ORIGINAL=$(ui label "$PID" "主题：" | sed 's/^主题：//')
 say "开始截图 → $OUT"
 theme 浅色
 press "概览" "点左侧「概览」" 0 exact
-press "近 30 天" "点「流量」右侧的「近 30 天」"; sleep 1; shot overview-light
+press "总览" "点「总览」" 0 exact;               shot overview-light
 theme 深色;                                      shot overview-dark
 theme 浅色
+press "趋势" "点「趋势」" 0 exact
+press "30 天" "点右上角的「30 天」";             sleep 1; shot trend
 press "内核" "点左侧「内核」" 0 exact;           shot sources
 press "设置" "点左侧「设置」" 0 exact;           shot settings
 [ -n "$ORIGINAL" ] && theme "$ORIGINAL"

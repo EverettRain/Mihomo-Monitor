@@ -103,8 +103,9 @@ def main():
     where.add_argument("--unix", help="listen on this unix socket")
     where.add_argument("--port", type=int, help="listen on 127.0.0.1:PORT")
     p.add_argument("--secret", default="", help="require this secret (HTTP only)")
-    p.add_argument("--up-total", type=int, default=1_200_000_000)
-    p.add_argument("--down-total", type=int, default=18_000_000_000)
+    # A real core counts from zero when it starts.
+    p.add_argument("--up-total", type=int, default=0)
+    p.add_argument("--down-total", type=int, default=0)
     a = p.parse_args()
 
     counters = Counters(a.up_total, a.down_total)

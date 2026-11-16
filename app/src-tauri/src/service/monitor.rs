@@ -82,11 +82,52 @@ pub struct Overview {
     pub week: Bytes,
     pub month: Bytes,
     pub year: Bytes,
-    /// The last 30 days, oldest first.
+    /// Everything ever recorded.
+    pub all_time: Bytes,
+    /// The last 53 weeks day by day (enough for a year heatmap), oldest first.
     pub days: Vec<DayPoint>,
     /// Today, hour by hour.
     pub hours: Vec<HourPoint>,
+    /// Today and this month of every recorded source, whatever `source` the overview is for.
+    pub by_source: Vec<SourceTotals>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceTotals {
+    pub id: i64,
+    pub today: Bytes,
+    pub month: Bytes,
+}
+
+/// Sums of contiguous bucket ranges in O(log n), over buckets sorted by time.
+struct Prefix {
+    buckets: Vec<i64>,
+    /// `sums[i]` is the total of the first `i` buckets.
+    sums: Vec<Bytes>,
+}
+
+impl Prefix {
+    fn new(mut rows: Vec<(i64, Bytes)>) -> Prefix {
+        rows.sort_by_key(|(b, _)| *b);
+        let mut sums = Vec::with_capacity(rows.len() + 1);
+        sums.push(Bytes::ZERO);
+        for (_, v) in &rows {
+            sums.push(*sums.last().unwrap_or(&Bytes::ZERO) + *v);
+        }
+        Prefix { buckets: rows.into_iter().map(|(b, _)| b).collect(), sums }
+    }
+
+    fn sum(&self, r: Range) -> Bytes {
+        let lo = self.buckets.partition_point(|&b| b < r.start);
+        let hi = self.buckets.partition_point(|&b| b < r.end);
+        let (a, b) = (self.sums[lo], self.sums[hi.max(lo)]);
+        Bytes { up: b.up - a.up, down: b.down - a.down }
+    }
+}
+
+/// Days in the year heatmap: 53 whole weeks.
+const HEATMAP_DAYS: usize = 53 * 7;
 
 /// One reading of a core's `/traffic`, at a unix second.
 #[derive(Clone, Copy, Debug)]
@@ -354,6 +395,20 @@ impl Monitor {
         st.live.iter().filter(|(id, _)| source.is_none_or(|s| s == **id)).flat_map(|(_, v)| v.iter().copied()).collect()
     }
 
+    /// Traffic per source in `range`: what is in the database plus what is still pending.
+    fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
+        let pending: Vec<(i64, Bytes)> =
+            lock(&self.state).pending.iter().filter(|((_, b), _)| range.contains(*b)).map(|((s, _), v)| (*s, *v)).collect();
+        let mut out = lock(&self.store).sums_by_source(range)?;
+        for (s, v) in pending {
+            match out.iter_mut().find(|(id, _)| *id == s) {
+                Some((_, total)) => *total += v,
+                None => out.push((s, v)),
+            }
+        }
+        Ok(out)
+    }
+
     /// Traffic per bucket in `range`: what is in the database plus what is still pending.
     fn buckets(&self, range: Range, source: Option<i64>) -> Result<Vec<(i64, Bytes)>, String> {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
@@ -375,18 +430,33 @@ impl Monitor {
         let week_start = if week_starts_sunday { Weekday::Sunday } else { Weekday::Monday };
         let p = |kind| period::current(kind, now, week_start).map_err(|e| e.to_string());
         let (day, week, month, year) = (p(Period::Day)?, p(Period::Week)?, p(Period::Month)?, p(Period::Year)?);
-        let days = period::last_days(now, 30).map_err(|e| e.to_string())?;
+        let days = period::last_days(now, HEATMAP_DAYS).map_err(|e| e.to_string())?;
         let hours = period::hours_of_today(now).map_err(|e| e.to_string())?;
         // One read covers every view: from the earliest start to the latest end.
         let start = [day.start, week.start, month.start, year.start, days[0].1.start].into_iter().min().unwrap_or(day.start);
         let end = [day.end, week.end, month.end, year.end].into_iter().max().unwrap_or(day.end);
-        let rows = self.buckets(Range { start, end }, source)?;
-        let sum = |r: Range| rows.iter().filter(|(b, _)| r.contains(*b)).fold(Bytes::ZERO, |acc, (_, v)| acc + *v);
+        let prefix = Prefix::new(self.buckets(Range { start, end }, source)?);
+        let sum = |r: Range| prefix.sum(r);
+        let everything = Range { start: i64::MIN, end: i64::MAX };
         Ok(Overview {
             today: sum(day),
             week: sum(week),
             month: sum(month),
             year: sum(year),
+            all_time: self
+                .sums_by_source(everything)?
+                .into_iter()
+                .filter(|(id, _)| source.is_none_or(|s| s == *id))
+                .fold(Bytes::ZERO, |a, (_, v)| a + v),
+            by_source: {
+                let (today, month) = (self.sums_by_source(day)?, self.sums_by_source(month)?);
+                let of = |list: &[(i64, Bytes)], id: i64| list.iter().find(|(s, _)| *s == id).map(|(_, v)| *v).unwrap_or_default();
+                lock(&self.store)
+                    .sources()?
+                    .into_iter()
+                    .map(|s| SourceTotals { id: s.id, today: of(&today, s.id), month: of(&month, s.id) })
+                    .collect()
+            },
             days: days
                 .iter()
                 .map(|(d, r)| {
@@ -444,6 +514,39 @@ mod tests {
         // Assert: the first reading of a new source is a baseline; the rest is counted once.
         assert_eq!(before, Bytes::new(80, 1_000));
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn overview_splits_by_source_and_covers_a_year() {
+        // Arrange: two sources, one with traffic already written and one still pending.
+        let store = Store::open_in_memory();
+        let a = store.ensure_source("a", "A", 0).unwrap();
+        let b = store.ensure_source("b", "B", 0).unwrap();
+        let m = Monitor::new(store, |_| {});
+        let now = noon().timestamp().as_second();
+        let last_year = now - 400 * 86_400;
+        let read = |key: &str, id: i64, totals: Bytes, at: i64, prev: Option<Bytes>| {
+            m.record(key, id, None, prev, Reading { totals, rate: Bytes::ZERO, at }).unwrap();
+        };
+        read("a", a, Bytes::new(0, 0), last_year, None);
+        read("a", a, Bytes::new(1, 10), last_year + 1, Some(Bytes::ZERO));
+        read("a", a, Bytes::new(3, 30), now, Some(Bytes::new(1, 10)));
+        m.flush().unwrap();
+        read("b", b, Bytes::new(0, 0), now, None);
+        read("b", b, Bytes::new(5, 50), now + 1, Some(Bytes::ZERO));
+
+        // Act
+        let all = m.overview_at(&noon(), None, false).unwrap();
+        let only_a = m.overview_at(&noon(), Some(a), false).unwrap();
+
+        // Assert
+        assert_eq!(all.today, Bytes::new(7, 70));
+        assert_eq!(all.all_time, Bytes::new(8, 80));
+        assert_eq!(only_a.all_time, Bytes::new(3, 30));
+        assert_eq!(all.days.len(), HEATMAP_DAYS);
+        assert_eq!(all.days.last().unwrap().down, 70);
+        let totals: Vec<_> = all.by_source.iter().map(|t| (t.id, t.today)).collect();
+        assert_eq!(totals, vec![(a, Bytes::new(2, 20)), (b, Bytes::new(5, 50))]);
     }
 
     #[test]

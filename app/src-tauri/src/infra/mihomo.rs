@@ -209,7 +209,8 @@ mod tests {
         assert!(parsed.iter().all(Option::is_none));
     }
 
-    /// A one-connection-at-a-time HTTP server on a unix socket, answering like mihomo.
+    /// A one-request-per-connection HTTP server on a unix socket, answering like mihomo. It says
+    /// `connection: close`, or the client would reuse a connection the server already dropped.
     #[cfg(unix)]
     fn fake_core(dir: &std::path::Path, secret_required: bool) -> PathBuf {
         use std::io::{BufRead, BufReader, Write};
@@ -226,13 +227,18 @@ mod tests {
                 }
                 let mut out = stream;
                 if secret_required {
-                    let _ = out.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n");
+                    let _ = out.write_all(b"HTTP/1.1 401 Unauthorized\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
                 } else if request.starts_with("GET /version") {
                     let body = r#"{"meta":true,"version":"v1.19.31"}"#;
-                    let _ =
-                        write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
                 } else {
-                    let _ = out.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n");
+                    let _ = out.write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+                    );
                     // Two samples, the second split across chunks, then the end of the stream.
                     for chunk in [
                         "{\"up\":10,\"down\":20,\"upTotal\":100,\"downTotal\":200}\n",

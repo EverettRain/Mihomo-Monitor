@@ -38,13 +38,24 @@ export interface HourPoint extends Bytes {
   start: number;
 }
 
+export interface SourceTotals {
+  id: number;
+  today: Bytes;
+  month: Bytes;
+}
+
 export interface Overview {
   today: Bytes;
   week: Bytes;
   month: Bytes;
   year: Bytes;
+  allTime: Bytes;
+  /** The last 53 weeks, oldest first, ending today. */
   days: DayPoint[];
+  /** Today, hour by hour. */
   hours: HourPoint[];
+  /** Every recorded core, whichever one the overview is for. */
+  bySource: SourceTotals[];
 }
 
 export interface ManualSource {

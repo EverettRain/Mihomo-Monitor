@@ -195,6 +195,21 @@ impl Store {
             .map_err(err)
     }
 
+    /// Total traffic per source in `range`; sources without traffic are left out.
+    pub fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT t.source_id, SUM(t.up), SUM(t.down)
+                 FROM traffic t JOIN dims d ON d.id = t.dim_id
+                 WHERE d.kind = 'outbound' AND t.bucket >= ?1 AND t.bucket < ?2
+                 GROUP BY t.source_id",
+            )
+            .map_err(err)?;
+        let rows = stmt.query_map(params![range.start, range.end], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
+        rows.collect::<Result<_, _>>().map_err(err)
+    }
+
     /// Per-bucket totals in `range`, oldest first; empty buckets are left out.
     pub fn buckets(&self, range: Range, source: Option<i64>) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self
