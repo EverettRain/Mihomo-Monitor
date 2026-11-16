@@ -67,6 +67,7 @@ pub fn run(start_in_tray: bool) {
             commands::set_lightweight,
             commands::set_autostart,
             commands::set_week_starts_sunday,
+            commands::set_auto_discover,
             commands::list_sources,
             commands::add_manual_source,
             commands::remove_manual_source,

@@ -229,7 +229,8 @@ mod tests {
                     let _ = out.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n");
                 } else if request.starts_with("GET /version") {
                     let body = r#"{"meta":true,"version":"v1.19.31"}"#;
-                    let _ = write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                    let _ =
+                        write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
                 } else {
                     let _ = out.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n");
                     // Two samples, the second split across chunks, then the end of the stream.

@@ -57,6 +57,7 @@ export interface Settings {
   lightweight: boolean;
   autostart: boolean;
   weekStartsSunday: boolean;
+  autoDiscover: boolean;
   manualSources: ManualSource[];
 }
 
@@ -79,6 +80,7 @@ export const api = {
   setLightweight: (enabled: boolean) => invoke<void>("set_lightweight", { enabled }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   setWeekStartsSunday: (enabled: boolean) => invoke<void>("set_week_starts_sunday", { enabled }),
+  setAutoDiscover: (enabled: boolean) => invoke<void>("set_auto_discover", { enabled }),
   listSources: () => invoke<Source[]>("list_sources"),
   addManualSource: (name: string, url: string, secret: string) => invoke<void>("add_manual_source", { name, url, secret }),
   removeManualSource: (url: string) => invoke<void>("remove_manual_source", { url }),

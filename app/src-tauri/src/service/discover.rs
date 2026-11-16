@@ -53,12 +53,34 @@ async fn first_answering(endpoints: &[Endpoint]) -> Result<(Endpoint, String), (
     Err(last)
 }
 
-pub async fn discover(manual: &[ManualSource]) -> Discovery {
+/// Cores on this machine (unless `auto` is off) and the manual entries.
+pub async fn discover(manual: &[ManualSource], auto: bool) -> Discovery {
     let mut out = Discovery::default();
+    if auto {
+        on_this_machine(&mut out).await;
+    }
+    for m in manual {
+        let ep = Endpoint::Http { url: m.url.clone(), secret: m.secret.clone() };
+        let key = manual_key(&m.url);
+        match first_answering(std::slice::from_ref(&ep)).await {
+            Ok((endpoint, version)) => out.found.push(Found { key, name: m.name.clone(), endpoint, core: None, version, manual: true }),
+            Err((_, reason)) => {
+                out.unreadable.push(Unreadable { key, name: m.name.clone(), endpoint: Some(m.url.clone()), reason, manual: true })
+            }
+        }
+    }
+    // One entry per source: a manual entry for a core that was also found locally adds nothing.
+    let mut seen = std::collections::HashSet::new();
+    out.found.retain(|f| seen.insert(f.key.clone()));
+    out.unreadable.retain(|u| !seen.contains(&u.key) && seen.insert(u.key.clone()));
+    out
+}
+
+async fn on_this_machine(out: &mut Discovery) {
     let cores = tokio::task::spawn_blocking(discovery::running_cores).await.unwrap_or_default();
 
     for core in &cores {
-        local(&mut out, core).await;
+        local(out, core).await;
     }
     // A Verge core whose process we cannot see at all (another user's session, or a process
     // list we may not read) can still be reached at its known locations.
@@ -99,21 +121,6 @@ pub async fn discover(manual: &[ManualSource]) -> Discovery {
             }
         }
     }
-    for m in manual {
-        let ep = Endpoint::Http { url: m.url.clone(), secret: m.secret.clone() };
-        let key = manual_key(&m.url);
-        match first_answering(std::slice::from_ref(&ep)).await {
-            Ok((endpoint, version)) => out.found.push(Found { key, name: m.name.clone(), endpoint, core: None, version, manual: true }),
-            Err((_, reason)) => {
-                out.unreadable.push(Unreadable { key, name: m.name.clone(), endpoint: Some(m.url.clone()), reason, manual: true })
-            }
-        }
-    }
-    // One entry per source: a manual entry for a core that was also found locally adds nothing.
-    let mut seen = std::collections::HashSet::new();
-    out.found.retain(|f| seen.insert(f.key.clone()));
-    out.unreadable.retain(|u| !seen.contains(&u.key) && seen.insert(u.key.clone()));
-    out
 }
 
 pub fn manual_key(url: &str) -> String {

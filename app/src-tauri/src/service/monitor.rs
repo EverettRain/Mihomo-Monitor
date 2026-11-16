@@ -106,6 +106,9 @@ struct State {
     sources: BTreeMap<String, SourceView>,
     /// Keys with a collector reading them.
     running: HashSet<String>,
+    /// Running keys no longer wanted (auto-discovery turned off, manual entry removed); their
+    /// collectors stop at the next reading.
+    stopping: HashSet<String>,
     live: HashMap<i64, VecDeque<LivePoint>>,
 }
 
@@ -150,9 +153,9 @@ impl Monitor {
     /// Finds cores forever: soon while none is being read, then once a minute to notice new ones.
     pub async fn supervise(self: Arc<Self>) {
         loop {
-            let manual = settings::load().manual_sources;
-            let found = discover::discover(&manual).await;
-            self.apply(found, &manual);
+            let s = settings::load();
+            let found = discover::discover(&s.manual_sources, s.auto_discover).await;
+            self.apply(found, &s);
             let idle = lock(&self.state).running.is_empty();
             let wait = if idle { Duration::from_secs(10) } else { Duration::from_secs(60) };
             tokio::select! {
@@ -171,13 +174,23 @@ impl Monitor {
         }
     }
 
-    fn apply(self: &Arc<Self>, d: Discovery, manual: &[settings::ManualSource]) {
-        let manual_keys: HashSet<String> = manual.iter().map(|m| discover::manual_key(&m.url)).collect();
+    fn apply(self: &Arc<Self>, d: Discovery, s: &settings::Settings) {
+        let manual_keys: HashSet<String> = s.manual_sources.iter().map(|m| discover::manual_key(&m.url)).collect();
+        let wanted = |key: &str, manual: bool| if manual { manual_keys.contains(key) } else { s.auto_discover };
         let mut start = Vec::new();
         {
             let mut st = lock(&self.state);
             // A removed manual source goes away, unless it has history worth keeping.
             st.sources.retain(|k, v| !v.manual || manual_keys.contains(k) || v.id.is_some());
+            let unwanted: Vec<String> =
+                st.sources.values().filter(|v| st.running.contains(&v.key) && !wanted(&v.key, v.manual)).map(|v| v.key.clone()).collect();
+            st.stopping.extend(unwanted);
+            if !s.auto_discover {
+                for v in st.sources.values_mut().filter(|v| !v.manual) {
+                    v.status = Status::Offline;
+                    v.message = Some("已关闭自动发现本机内核".into());
+                }
+            }
             for u in d.unreadable {
                 if st.running.contains(&u.key) {
                     continue;
@@ -198,6 +211,7 @@ impl Monitor {
                 );
             }
             for f in d.found {
+                st.stopping.remove(&f.key);
                 if st.running.insert(f.key.clone()) {
                     start.push(f);
                 }
@@ -272,7 +286,7 @@ impl Monitor {
             None
         };
         let mut st = lock(&self.state);
-        if !st.sources.contains_key(key) {
+        if st.stopping.remove(key) || !st.sources.contains_key(key) {
             return None;
         }
         let delta = match prev {
@@ -451,16 +465,19 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_source_stops_being_recorded() {
-        // Arrange
+    fn an_unwanted_source_stops_being_recorded() {
+        // Arrange: a local core being read when auto-discovery is turned off.
         let (m, id) = monitor_with_source();
-        lock(&m.state).sources.remove("a");
+        lock(&m.state).running.insert("a".into());
+        let off = settings::Settings { auto_discover: false, ..settings::Settings::default() };
 
         // Act
+        m.apply(Discovery::default(), &off);
         let point = m.record("a", id, None, None, Reading { totals: Bytes::new(1, 1), rate: Bytes::ZERO, at: 0 });
 
         // Assert
         assert!(point.is_none());
+        assert_eq!(m.sources()[0].status, Status::Offline);
     }
 
     #[test]

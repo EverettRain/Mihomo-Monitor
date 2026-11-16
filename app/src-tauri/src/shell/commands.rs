@@ -43,6 +43,7 @@ pub struct SettingsView {
     lightweight: bool,
     autostart: bool,
     week_starts_sunday: bool,
+    auto_discover: bool,
     manual_sources: Vec<ManualSource>,
 }
 
@@ -53,6 +54,7 @@ pub fn get_settings(app: AppHandle) -> SettingsView {
         lightweight: s.lightweight,
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         week_starts_sunday: s.week_starts_sunday,
+        auto_discover: s.auto_discover,
         manual_sources: s.manual_sources,
     }
 }
@@ -73,6 +75,13 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn set_week_starts_sunday(enabled: bool) -> Result<(), String> {
     settings::update(|s| s.week_starts_sunday = enabled).map(|_| ())
+}
+
+#[tauri::command]
+pub fn set_auto_discover(monitor: Mon, enabled: bool) -> Result<(), String> {
+    settings::update(|s| s.auto_discover = enabled)?;
+    monitor.rediscover();
+    Ok(())
 }
 
 #[tauri::command]

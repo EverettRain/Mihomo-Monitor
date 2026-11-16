@@ -24,12 +24,20 @@ pub struct Settings {
     pub autostart_initialized: bool,
     /// Weeks start on Sunday instead of Monday.
     pub week_starts_sunday: bool,
+    /// Look for cores on this machine; off, only the manual entries are read.
+    pub auto_discover: bool,
     pub manual_sources: Vec<ManualSource>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { lightweight: true, autostart_initialized: false, week_starts_sunday: false, manual_sources: Vec::new() }
+        Settings {
+            lightweight: true,
+            autostart_initialized: false,
+            week_starts_sunday: false,
+            auto_discover: true,
+            manual_sources: Vec::new(),
+        }
     }
 }
 

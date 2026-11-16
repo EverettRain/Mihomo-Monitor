@@ -1,8 +1,9 @@
 import { Loader2, Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
-import { Group, Page, PageHeader } from "@/components/PageHeader";
+import { useEffect, useState } from "react";
+import { Group, Page, PageHeader, Row } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type Source } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -43,6 +44,21 @@ export function SourcesPage({ sources }: { sources: Source[] | null }) {
   const [url, setUrl] = useState("");
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
+  const [auto, setAuto] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    void api.getSettings().then((s) => setAuto(s.autoDiscover)).catch(() => {});
+  }, []);
+
+  const toggleAuto = async (v: boolean) => {
+    setAuto(v);
+    try {
+      await api.setAutoDiscover(v);
+    } catch (e) {
+      setAuto(!v);
+      toast(errorText(e), "error");
+    }
+  };
 
   const add = async () => {
     setBusy(true);
@@ -73,6 +89,12 @@ export function SourcesPage({ sources }: { sources: Source[] | null }) {
     <Page>
       <PageHeader title="内核" subtitle="自动发现本机正在运行的 mihomo 内核，读取它的流量计数；不会改动客户端的任何设置。" />
       <div className="space-y-5 px-5">
+        <Group>
+          <Row label="自动发现本机内核" hint="关闭后只读取手动添加的内核，例如只想统计路由器的流量时。">
+            <Switch label="自动发现本机内核" checked={auto ?? true} disabled={auto === null} onCheckedChange={(v) => void toggleAuto(v)} />
+          </Row>
+        </Group>
+
         <Group label="内核">
           {sources === null ? (
             <div className="flex items-center gap-2 px-4 py-3 text-[12.5px] text-muted">
