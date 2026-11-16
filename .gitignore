@@ -1,0 +1,28 @@
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Local reference material, not part of the project.
+references/
+
+# macOS
+.DS_Store
+._*
+.AppleDouble/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editors
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+
+*.log
+*.tsbuildinfo
+__pycache__/
+*.pyc
