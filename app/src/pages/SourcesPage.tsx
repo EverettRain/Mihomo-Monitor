@@ -137,7 +137,7 @@ export function SourcesPage({ sources }: { sources: Source[] | null }) {
         </Group>
 
         <p className="px-1 text-[11.5px] leading-[18px] text-muted">
-          总量取自内核的累计计数（upTotal / downTotal），Mihomo-Monitor 退出或电脑睡眠期间的流量，只要内核没有重启，下次读取时会补回。内核和 Mihomo-Monitor
+          总量取自内核自身的累计计数，Mihomo-Monitor 退出或电脑睡眠期间的流量，只要内核没有重启，下次读取时会补回。内核和 Mihomo-Monitor
           同时停止期间的流量无法找回。
         </p>
       </div>
