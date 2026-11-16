@@ -31,6 +31,18 @@ export function bytesShort(n: number): string {
   return `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${UNITS[i]}`;
 }
 
+/** A local date as YYYY-MM-DD. */
+export function isoDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Parses YYYY-MM-DD as a local date (midnight). */
+export function parseDate(s: string): Date {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** A per-second rate. */
 export function rate(n: number): string {
   return `${bytes(n)}/s`;

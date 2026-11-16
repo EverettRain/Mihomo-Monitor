@@ -195,6 +195,15 @@ impl Store {
             .map_err(err)
     }
 
+    /// First and last bucket holding traffic, of one source or of all.
+    pub fn bounds(&self, source: Option<i64>) -> Result<Option<(i64, i64)>, String> {
+        self.conn
+            .query_row("SELECT MIN(bucket), MAX(bucket) FROM traffic WHERE ?1 IS NULL OR source_id = ?1", [source], |r| {
+                Ok(r.get::<_, Option<i64>>(0)?.zip(r.get::<_, Option<i64>>(1)?))
+            })
+            .map_err(err)
+    }
+
     /// Total traffic per source in `range`; sources without traffic are left out.
     pub fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self

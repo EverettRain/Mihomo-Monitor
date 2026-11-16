@@ -60,6 +60,7 @@ pub fn run(start_in_tray: bool) {
         .plugin(tauri_plugin_autostart::Builder::new().args(["--tray"]).build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(window::on_event)
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -73,6 +74,10 @@ pub fn run(start_in_tray: bool) {
             commands::remove_manual_source,
             commands::overview,
             commands::live,
+            commands::history,
+            commands::data_bounds,
+            commands::top_days,
+            commands::export_csv,
             commands::release_notes,
             commands::open_release_page,
             commands::open_data_dir,

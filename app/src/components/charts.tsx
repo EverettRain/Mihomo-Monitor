@@ -189,8 +189,11 @@ function column(x: number, y: number, w: number, h: number, r: number) {
   return `M${x},${y + h}V${y + k}Q${x},${y} ${x + k},${y}H${x + w - k}Q${x + w},${y} ${x + w},${y + k}V${y + h}Z`;
 }
 
-/** Download and upload stacked per period, with a per-column readout and a table view. */
-export function StackedBars({ items, ariaLabel }: { items: BarItem[]; ariaLabel: string }) {
+/**
+ * Download and upload stacked per period, with a per-column readout and, unless the page shows
+ * its own table (`tableToggle={false}`), a table view.
+ */
+export function StackedBars({ items, ariaLabel, tableToggle = true }: { items: BarItem[]; ariaLabel: string; tableToggle?: boolean }) {
   const [box, width] = useWidth();
   const [active, setActive] = useState<number | null>(null);
   const [table, setTable] = useState(false);
@@ -208,9 +211,11 @@ export function StackedBars({ items, ariaLabel }: { items: BarItem[]; ariaLabel:
     <div>
       <div className="mb-2 flex items-center justify-between gap-3">
         <Legend />
-        <button className="shrink-0 text-[11.5px] text-muted hover:text-fg active:!scale-100" onClick={() => setTable((t) => !t)}>
-          {table ? "图表" : "表格"}
-        </button>
+        {tableToggle && (
+          <button className="shrink-0 text-[11.5px] text-muted hover:text-fg active:!scale-100" onClick={() => setTable((t) => !t)}>
+            {table ? "图表" : "表格"}
+          </button>
+        )}
       </div>
       {table ? (
         <div className="max-h-[220px] overflow-y-auto rounded-lg border border-line-2">

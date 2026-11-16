@@ -8,7 +8,8 @@ use crate::domain::period::{self, bucket_of, Period, Range};
 use crate::infra::mihomo::Client;
 use crate::infra::store::{BucketDelta, Store};
 use crate::infra::{paths, settings};
-use jiff::civil::Weekday;
+use jiff::civil::{Date, Weekday};
+use jiff::tz::TimeZone;
 use jiff::ZonedDateTime;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -123,6 +124,53 @@ impl Prefix {
         let hi = self.buckets.partition_point(|&b| b < r.end);
         let (a, b) = (self.sums[lo], self.sums[hi.max(lo)]);
         Bytes { up: b.up - a.up, down: b.down - a.down }
+    }
+}
+
+/// One period of a history view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeriodRow {
+    /// Unix seconds.
+    pub start: i64,
+    pub end: i64,
+    pub label: String,
+    pub up: u64,
+    pub down: u64,
+}
+
+/// Local dates holding the first and the last recorded traffic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bounds {
+    pub first: String,
+    pub last: String,
+}
+
+/// Hour views read at most this many days, so a mistaken range cannot ask for a decade of hours.
+const MAX_HOUR_DAYS: i32 = 62;
+
+fn label(kind: Period, start: &ZonedDateTime, end: i64) -> String {
+    match kind {
+        Period::Hour => start.strftime("%H:00").to_string(),
+        Period::Day => start.strftime("%Y-%m-%d").to_string(),
+        Period::Week => {
+            let last = jiff::Timestamp::from_second(end - 1).map(|t| t.to_zoned_datetime(start.time_zone().clone()));
+            match last {
+                Ok(l) => format!("{} – {}", start.strftime("%Y-%m-%d"), l.strftime("%m-%d")),
+                Err(_) => start.strftime("%Y-%m-%d").to_string(),
+            }
+        }
+        Period::Month => start.strftime("%Y-%m").to_string(),
+        Period::Year => start.strftime("%Y").to_string(),
+    }
+}
+
+fn week_start(sunday: bool) -> Weekday {
+    if sunday {
+        Weekday::Sunday
+    } else {
+        Weekday::Monday
     }
 }
 
@@ -474,6 +522,72 @@ impl Monitor {
         })
     }
 
+    /// Traffic per period of `kind` over the local days `from` through `to`, oldest first.
+    pub fn history(
+        &self,
+        kind: Period,
+        from: Date,
+        to: Date,
+        source: Option<i64>,
+        week_starts_sunday: bool,
+    ) -> Result<Vec<PeriodRow>, String> {
+        self.history_in(&TimeZone::system(), kind, from, to, source, week_starts_sunday)
+    }
+
+    fn history_in(
+        &self,
+        tz: &TimeZone,
+        kind: Period,
+        from: Date,
+        to: Date,
+        source: Option<i64>,
+        week_starts_sunday: bool,
+    ) -> Result<Vec<PeriodRow>, String> {
+        if to < from {
+            return Ok(Vec::new());
+        }
+        if kind == Period::Hour && from.until(to).map_err(|e| e.to_string())?.get_days() > MAX_HOUR_DAYS {
+            return Err(format!("按小时查看最多 {MAX_HOUR_DAYS} 天。"));
+        }
+        let periods = period::periods(kind, from, to, tz, week_start(week_starts_sunday)).map_err(|e| e.to_string())?;
+        let (Some(first), Some(last)) = (periods.first(), periods.last()) else { return Ok(Vec::new()) };
+        let prefix = Prefix::new(self.buckets(Range { start: first.1.start, end: last.1.end }, source)?);
+        Ok(periods
+            .iter()
+            .map(|(z, r)| {
+                let b = prefix.sum(*r);
+                PeriodRow { start: r.start, end: r.end, label: label(kind, z, r.end), up: b.up, down: b.down }
+            })
+            .collect())
+    }
+
+    /// The local dates of the first and last recorded traffic; `None` before any.
+    pub fn bounds(&self, source: Option<i64>) -> Result<Option<Bounds>, String> {
+        let pending: Vec<i64> = lock(&self.state).pending.keys().filter(|(s, _)| source.is_none_or(|x| x == *s)).map(|(_, b)| *b).collect();
+        let stored = lock(&self.store).bounds(source)?;
+        let lo = stored.map(|(a, _)| a).into_iter().chain(pending.iter().copied()).min();
+        let hi = stored.map(|(_, b)| b).into_iter().chain(pending.iter().copied()).max();
+        let tz = TimeZone::system();
+        let date = |ts: i64| jiff::Timestamp::from_second(ts).map(|t| t.to_zoned_datetime(tz.clone()).date().to_string());
+        match (lo, hi) {
+            (Some(lo), Some(hi)) => {
+                Ok(Some(Bounds { first: date(lo).map_err(|e| e.to_string())?, last: date(hi).map_err(|e| e.to_string())? }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The `n` days with the most traffic, biggest first (vnstat's top list).
+    pub fn top_days(&self, source: Option<i64>, n: usize) -> Result<Vec<PeriodRow>, String> {
+        let Some(b) = self.bounds(source)? else { return Ok(Vec::new()) };
+        let parse = |s: &str| s.parse::<Date>().map_err(|e| e.to_string());
+        let mut days = self.history(Period::Day, parse(&b.first)?, parse(&b.last)?, source, false)?;
+        days.retain(|d| d.up + d.down > 0);
+        days.sort_by_key(|d| std::cmp::Reverse(d.up + d.down));
+        days.truncate(n);
+        Ok(days)
+    }
+
     /// Today's traffic of every source, for the tray.
     pub fn today(&self) -> Bytes {
         self.overview(None, false).map(|o| o.today).unwrap_or_default()
@@ -547,6 +661,51 @@ mod tests {
         assert_eq!(all.days.last().unwrap().down, 70);
         let totals: Vec<_> = all.by_source.iter().map(|t| (t.id, t.today)).collect();
         assert_eq!(totals, vec![(a, Bytes::new(2, 20)), (b, Bytes::new(5, 50))]);
+    }
+
+    #[test]
+    fn history_sums_each_period_and_top_days_rank_them() {
+        // Arrange: three days of traffic in Asia/Shanghai, the middle one the busiest.
+        let (m, id) = monitor_with_source();
+        let tz = TimeZone::get("Asia/Shanghai").unwrap();
+        let at =
+            |d: i8, h: i8| jiff::civil::date(2026, 11, d).at(h, 0, 0, 0).to_zoned_datetime(tz.clone()).unwrap().timestamp().as_second();
+        let mut prev = None;
+        for (i, (ts, total)) in [(at(15, 9), 0), (at(15, 10), 100), (at(16, 23), 1_100), (at(17, 0), 1_150)].into_iter().enumerate() {
+            let t = Bytes::new(0, total);
+            m.record("a", id, None, if i == 0 { None } else { prev }, Reading { totals: t, rate: Bytes::ZERO, at: ts }).unwrap();
+            prev = Some(t);
+        }
+        let (from, to) = (jiff::civil::date(2026, 11, 15), jiff::civil::date(2026, 11, 17));
+
+        // Act
+        let days = m.history_in(&tz, Period::Day, from, to, Some(id), false).unwrap();
+        let hours = m.history_in(&tz, Period::Hour, to, to, Some(id), false).unwrap();
+        let weeks = m.history_in(&tz, Period::Week, from, to, Some(id), false).unwrap();
+
+        // Assert
+        assert_eq!(
+            days.iter().map(|d| (d.label.as_str(), d.down)).collect::<Vec<_>>(),
+            [("2026-11-15", 100), ("2026-11-16", 1_000), ("2026-11-17", 50)]
+        );
+        assert_eq!(hours[0], PeriodRow { start: at(17, 0), end: at(17, 1), label: "00:00".into(), up: 0, down: 50 });
+        assert_eq!(
+            weeks.iter().map(|w| (w.label.as_str(), w.down)).collect::<Vec<_>>(),
+            [("2026-11-09 – 11-15", 100), ("2026-11-16 – 11-22", 1_050)]
+        );
+    }
+
+    #[test]
+    fn hour_views_are_limited_in_length() {
+        // Arrange
+        let (m, _) = monitor_with_source();
+        let tz = TimeZone::get("Asia/Shanghai").unwrap();
+
+        // Act
+        let result = m.history_in(&tz, Period::Hour, jiff::civil::date(2026, 1, 1), jiff::civil::date(2026, 6, 1), None, false);
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[test]

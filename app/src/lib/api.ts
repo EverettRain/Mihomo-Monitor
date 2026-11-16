@@ -58,6 +58,22 @@ export interface Overview {
   bySource: SourceTotals[];
 }
 
+export type PeriodUnit = "hour" | "day" | "week" | "month" | "year";
+
+/** One period of a history view. */
+export interface PeriodRow extends Bytes {
+  /** Unix seconds. */
+  start: number;
+  end: number;
+  label: string;
+}
+
+/** Local dates (YYYY-MM-DD) of the first and last recorded traffic. */
+export interface Bounds {
+  first: string;
+  last: string;
+}
+
 export interface ManualSource {
   name: string;
   url: string;
@@ -97,6 +113,11 @@ export const api = {
   removeManualSource: (url: string) => invoke<void>("remove_manual_source", { url }),
   overview: (source: number | null) => invoke<Overview>("overview", { source }),
   live: (source: number | null) => invoke<LivePoint[]>("live", { source }),
+  history: (unit: PeriodUnit, from: string, to: string, source: number | null) => invoke<PeriodRow[]>("history", { unit, from, to, source }),
+  dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
+  topDays: (source: number | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, limit }),
+  /** Opens a save dialog; false when the user cancelled it. */
+  exportCsv: (name: string, content: string) => invoke<boolean>("export_csv", { name, content }),
   releaseNotes: (after: string, upto: string) => invoke<ReleaseNote[]>("release_notes", { after, upto }),
   openReleasePage: (version: string) => invoke<void>("open_release_page", { version }),
   openDataDir: () => invoke<void>("open_data_dir"),

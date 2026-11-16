@@ -1,15 +1,17 @@
 //! Tauri commands the interface calls.
 
 use super::tray;
+use crate::domain::period::Period;
 use crate::infra::discovery::controller_url;
 use crate::infra::paths;
 use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
-use crate::service::monitor::{LivePoint, Monitor, Overview, SourceView};
+use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, SourceView};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
 type Mon<'a> = State<'a, Arc<Monitor>>;
@@ -111,6 +113,42 @@ pub fn remove_manual_source(monitor: Mon, url: String) -> Result<(), String> {
 #[tauri::command]
 pub fn overview(monitor: Mon, source: Option<i64>) -> Result<Overview, String> {
     monitor.overview(source, settings::load().week_starts_sunday)
+}
+
+fn date(s: &str) -> Result<jiff::civil::Date, String> {
+    s.parse().map_err(|_| format!("日期格式无效：{s}"))
+}
+
+#[tauri::command]
+pub fn history(monitor: Mon, unit: Period, from: String, to: String, source: Option<i64>) -> Result<Vec<PeriodRow>, String> {
+    monitor.history(unit, date(&from)?, date(&to)?, source, settings::load().week_starts_sunday)
+}
+
+#[tauri::command]
+pub fn data_bounds(monitor: Mon, source: Option<i64>) -> Result<Option<Bounds>, String> {
+    monitor.bounds(source)
+}
+
+#[tauri::command]
+pub fn top_days(monitor: Mon, source: Option<i64>, limit: usize) -> Result<Vec<PeriodRow>, String> {
+    monitor.top_days(source, limit.min(100))
+}
+
+/// Asks where to save and writes the CSV there. The page hands over only the text; the path
+/// comes from the save dialog, so no page code can write elsewhere. `false` when cancelled.
+#[tauri::command]
+pub async fn export_csv(app: AppHandle, name: String, content: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app.dialog().file().set_file_name(&name).add_filter("CSV", &["csv"]).blocking_save_file() else {
+            return Ok(false);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        // With a byte-order mark, Excel opens UTF-8 CSV with Chinese text correctly.
+        std::fs::write(&path, format!("\u{feff}{content}")).map_err(|e| format!("无法保存：{e}"))?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
