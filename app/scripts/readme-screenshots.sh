@@ -163,6 +163,11 @@ theme 深色;                                      shot overview-dark
 theme 浅色
 press "趋势" "点「趋势」" 0 exact
 press "30 天" "点右上角的「30 天」";             sleep 1; shot trend
+press "历史" "点左侧「历史」" 0 exact;           sleep 1; shot history
+press "分布" "点左侧「分布」" 0 exact
+press "近 30 天" "点右上角的「近 30 天」"
+press "进程" "点「进程」" 0 exact
+press "Google Chrome" "点「Google Chrome」展开它访问的域名"; shot breakdown
 press "内核" "点左侧「内核」" 0 exact;           shot sources
 press "设置" "点左侧「设置」" 0 exact;           shot settings
 [ -n "$ORIGINAL" ] && theme "$ORIGINAL"
