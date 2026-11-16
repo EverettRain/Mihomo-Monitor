@@ -1,0 +1,60 @@
+name: CI
+
+# Changes that leave the app untouched (README, docs, the screenshot script) need no build.
+# Branches only: a release tag points at a commit CI already built, and release.yml builds it.
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "docs/**", "app/scripts/readme-screenshots.sh", "app/scripts/fake-mihomo.py"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "app/scripts/readme-screenshots.sh", "app/scripts/fake-mihomo.py"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build:renderer
+      - run: pnpm test:rust
+  # The collector's unix-socket path only exists on macOS (and Linux); test it there as well.
+  check-macos:
+    runs-on: macos-15-intel
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:renderer
+      - run: pnpm test:rust
