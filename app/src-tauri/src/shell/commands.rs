@@ -2,11 +2,12 @@
 
 use super::tray;
 use crate::domain::period::Period;
+use crate::domain::split::DimKind;
 use crate::infra::discovery::controller_url;
 use crate::infra::paths;
 use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
-use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, SourceView};
+use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -122,6 +123,24 @@ fn date(s: &str) -> Result<jiff::civil::Date, String> {
 #[tauri::command]
 pub fn history(monitor: Mon, unit: Period, from: String, to: String, source: Option<i64>) -> Result<Vec<PeriodRow>, String> {
     monitor.history(unit, date(&from)?, date(&to)?, source, settings::load().week_starts_sunday)
+}
+
+#[tauri::command]
+pub fn ranking(monitor: Mon, kind: DimKind, from: String, to: String, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+    monitor.ranking(kind, date(&from)?, date(&to)?, source)
+}
+
+/// Hosts most traffic went to; `process` narrows them to one process.
+#[tauri::command]
+pub fn hosts(
+    monitor: Mon,
+    from: String,
+    to: String,
+    source: Option<i64>,
+    process: Option<String>,
+    merge: bool,
+) -> Result<Vec<RankRow>, String> {
+    monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), merge, 100)
 }
 
 #[tauri::command]

@@ -1,13 +1,16 @@
-//! The background service: keeps finding cores, reads each one's `/traffic`, accumulates the
-//! traffic in memory and writes it to the database once a minute (and on exit), and answers the
-//! interface's questions.
+//! The background service: keeps finding cores and reads each one. `/traffic` gives the
+//! per-second rate for the live chart; `/connections`, polled every two seconds, gives the
+//! counters the statistics are built on and, from the open connections, where the traffic went.
+//! Traffic accumulates in memory and is written to the database once a minute (and on exit).
+//! Also answers the interface's questions.
 
 use super::discover::{self, Discovery, Found};
 use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
 use crate::domain::period::{self, bucket_of, Period, Range};
+use crate::domain::split::{self, DimKind, Dims, Tracker};
 use crate::infra::mihomo::Client;
-use crate::infra::store::{BucketDelta, Store};
-use crate::infra::{paths, settings};
+use crate::infra::store::{BucketDelta, HostDelta, Store};
+use crate::infra::{discovery, paths, settings, verge};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use jiff::ZonedDateTime;
@@ -20,6 +23,12 @@ use tokio::sync::Notify;
 /// Seconds of per-second rates kept for the live chart.
 const LIVE_SECS: usize = 600;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(60);
+/// How often the open connections are read. Shorter catches more of the last bytes of
+/// connections that close quickly; each read parses the whole connection list.
+const POLL_EVERY: Duration = Duration::from_secs(2);
+/// A finished day keeps this many (process, host) pairs, and each process its own biggest few.
+const HOSTS_KEPT: usize = 200;
+const HOSTS_PER_PROCESS: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,6 +148,23 @@ pub struct PeriodRow {
     pub down: u64,
 }
 
+/// One key of a ranking: a node, subscription, process, inbound or host. The empty key is
+/// traffic that could not be attributed (or, for hosts, the many small ones folded together).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankRow {
+    pub key: String,
+    pub up: u64,
+    pub down: u64,
+}
+
+fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
+    let mut rows: Vec<RankRow> =
+        map.into_iter().filter(|(_, b)| !b.is_zero()).map(|(key, b)| RankRow { key, up: b.up, down: b.down }).collect();
+    rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)));
+    rows
+}
+
 /// Local dates holding the first and the last recorded traffic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,18 +203,20 @@ fn week_start(sunday: bool) -> Weekday {
 /// Days in the year heatmap: 53 whole weeks.
 const HEATMAP_DAYS: usize = 53 * 7;
 
-/// One reading of a core's `/traffic`, at a unix second.
-#[derive(Clone, Copy, Debug)]
-struct Reading {
-    totals: Bytes,
-    rate: Bytes,
-    at: i64,
+/// Local date of a unix second, `YYYY-MM-DD`.
+fn local_day(ts: i64) -> String {
+    jiff::Timestamp::from_second(ts).map(|t| t.to_zoned_datetime(TimeZone::system()).date().to_string()).unwrap_or_default()
 }
 
 #[derive(Default)]
 struct State {
-    /// Traffic not yet in the database, per (source, bucket).
-    pending: BTreeMap<(i64, i64), Bytes>,
+    /// Traffic not yet in the database, per (source, bucket, dimension kind, key). The outbound
+    /// entries of a bucket add up to its total.
+    pending: BTreeMap<(i64, i64, DimKind, String), Bytes>,
+    /// Host traffic not yet in the database, per (source, local day, process, host).
+    pending_hosts: BTreeMap<(i64, String, String, String), Bytes>,
+    /// Finished days before this one have had their hosts cut down to the top ones.
+    hosts_pruned_before: String,
     /// Latest counters accounted for, per source; written with `pending`.
     checkpoints: HashMap<i64, Checkpoint>,
     dirty: HashSet<i64>,
@@ -347,28 +375,59 @@ impl Monitor {
         self.wake.notify_one();
     }
 
+    /// Reads a core until it fails or is no longer wanted: rates and accounting side by side.
     async fn read(&self, f: &Found, id: i64) -> Result<(), String> {
         let client = Client::new(&f.endpoint).map_err(|e| e.to_string())?;
+        tokio::select! {
+            r = self.read_rates(&client, f, id) => r,
+            r = self.read_connections(&client, f, id) => r,
+        }
+    }
+
+    async fn read_rates(&self, client: &Client, f: &Found, id: i64) -> Result<(), String> {
         let mut stream = client.traffic().await.map_err(|e| e.to_string())?;
         self.set_status(&f.key, Status::Online, None);
-        let mut prev: Option<Bytes> = None;
         while let Some(sample) = stream.next().await.map_err(|e| e.to_string())? {
-            let totals = sample.totals.ok_or("内核版本过旧：/traffic 没有累计流量（upTotal / downTotal），请升级 mihomo")?;
-            let reading = Reading { totals, rate: sample.rate, at: paths::now_secs() };
-            let Some(point) = self.record(&f.key, id, f.core.as_ref(), prev, reading) else {
-                return Ok(());
-            };
-            prev = Some(totals);
+            let Some(point) = self.live_point(&f.key, id, sample.rate, paths::now_secs()) else { return Ok(()) };
             (self.sink)(Event::Sample(point));
         }
         Err("内核关闭了连接".into())
     }
 
-    /// Accounts one reading of a source's counters. `prev` is the previous reading on the same
-    /// connection; without one the reading is checked against the last checkpoint. Returns
-    /// `None` when the source is no longer wanted.
-    fn record(&self, key: &str, id: i64, core: Option<&CoreId>, prev: Option<Bytes>, r: Reading) -> Option<LivePoint> {
-        let Reading { totals, rate, at: now } = r;
+    async fn read_connections(&self, client: &Client, f: &Found, id: i64) -> Result<(), String> {
+        let mut prev: Option<Bytes> = None;
+        let mut tracker = Tracker::default();
+        let mut profile = (f.key == discovery::VERGE_KEY).then(verge::ActiveProfile::default);
+        let mut tick = tokio::time::interval(POLL_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let snap = client.connections().await.map_err(|e| e.to_string())?;
+            let subscription = profile.as_mut().and_then(|p| p.get().map(str::to_string));
+            let deltas: Vec<(Dims, Bytes)> =
+                tracker.step(&snap.conns).into_iter().map(|(c, b)| (split::dims_of(c, subscription.as_deref()), b)).collect();
+            if !self.account(&f.key, id, f.core.as_ref(), prev, snap.totals, &deltas, paths::now_secs()) {
+                return Ok(());
+            }
+            prev = Some(snap.totals);
+        }
+    }
+
+    /// Accounts one reading of a source's counters and the growth of its connections since the
+    /// last reading. `prev` is the previous reading on the same connection; without one the
+    /// reading is checked against the last checkpoint. Returns `false` when the source is no
+    /// longer wanted.
+    #[allow(clippy::too_many_arguments)]
+    fn account(
+        &self,
+        key: &str,
+        id: i64,
+        core: Option<&CoreId>,
+        prev: Option<Bytes>,
+        totals: Bytes,
+        conns: &[(Dims, Bytes)],
+        now: i64,
+    ) -> bool {
         let saved = if prev.is_none() && !lock(&self.state).checkpoints.contains_key(&id) {
             lock(&self.store).checkpoint(id).ok().flatten()
         } else {
@@ -376,17 +435,34 @@ impl Monitor {
         };
         let mut st = lock(&self.state);
         if st.stopping.remove(key) || !st.sources.contains_key(key) {
-            return None;
+            return false;
         }
         let delta = match prev {
             Some(p) => counter::step(p, totals),
             None => counter::resume(st.checkpoints.get(&id).or(saved.as_ref()), core, totals),
         };
-        if !delta.is_zero() {
-            *st.pending.entry((id, bucket_of(now))).or_default() += delta;
+        if !delta.is_zero() || !conns.is_empty() {
+            let s = split::split(delta, conns);
+            let bucket = bucket_of(now);
+            for ((kind, k), b) in s.dims {
+                *st.pending.entry((id, bucket, kind, k)).or_default() += b;
+            }
+            let day = local_day(now);
+            for ((process, host), b) in s.hosts {
+                *st.pending_hosts.entry((id, day.clone(), process, host)).or_default() += b;
+            }
         }
         st.checkpoints.insert(id, Checkpoint { core: core.cloned(), totals, at: now });
         st.dirty.insert(id);
+        true
+    }
+
+    /// Keeps a per-second rate for the live chart; `None` when the source is no longer wanted.
+    fn live_point(&self, key: &str, id: i64, rate: Bytes, now: i64) -> Option<LivePoint> {
+        let mut st = lock(&self.state);
+        if st.stopping.contains(key) || !st.sources.contains_key(key) {
+            return None;
+        }
         let point = LivePoint { source: id, at: now, up: rate.up, down: rate.down };
         let live = st.live.entry(id).or_default();
         live.push_back(point);
@@ -407,7 +483,7 @@ impl Monitor {
     /// Writes the accumulated traffic and checkpoints. On failure they stay in memory for the
     /// next attempt.
     pub fn flush(&self) -> Result<(), String> {
-        let (pending, dirty) = {
+        let (pending, hosts, dirty) = {
             let mut st = lock(&self.state);
             let dirty: Vec<(i64, Checkpoint)> = st
                 .dirty
@@ -416,21 +492,53 @@ impl Monitor {
                 .into_iter()
                 .filter_map(|id| st.checkpoints.get(&id).map(|c| (id, c.clone())))
                 .collect();
-            (std::mem::take(&mut st.pending), dirty)
+            (std::mem::take(&mut st.pending), std::mem::take(&mut st.pending_hosts), dirty)
         };
-        if pending.is_empty() && dirty.is_empty() {
+        if !(pending.is_empty() && hosts.is_empty() && dirty.is_empty()) {
+            let deltas: Vec<BucketDelta> = pending
+                .iter()
+                .map(|((source, bucket, kind, key), bytes)| BucketDelta {
+                    source: *source,
+                    bucket: *bucket,
+                    kind: *kind,
+                    key: key.clone(),
+                    bytes: *bytes,
+                })
+                .collect();
+            let host_deltas: Vec<HostDelta> = hosts
+                .iter()
+                .map(|((source, day, process, host), bytes)| HostDelta {
+                    source: *source,
+                    day: day.clone(),
+                    process: process.clone(),
+                    host: host.clone(),
+                    bytes: *bytes,
+                })
+                .collect();
+            let result = lock(&self.store).commit(&deltas, &host_deltas, &dirty);
+            if result.is_err() {
+                let mut st = lock(&self.state);
+                for (k, v) in pending {
+                    *st.pending.entry(k).or_default() += v;
+                }
+                for (k, v) in hosts {
+                    *st.pending_hosts.entry(k).or_default() += v;
+                }
+                st.dirty.extend(dirty.into_iter().map(|(id, _)| id));
+                return result;
+            }
+        }
+        self.prune_finished_days(&local_day(paths::now_secs()))
+    }
+
+    /// Once a day: finished days keep only their top hosts (today stays exact).
+    fn prune_finished_days(&self, today: &str) -> Result<(), String> {
+        if lock(&self.state).hosts_pruned_before.as_str() >= today {
             return Ok(());
         }
-        let deltas: Vec<BucketDelta> = pending.iter().map(|(&(source, bucket), &bytes)| BucketDelta { source, bucket, bytes }).collect();
-        let result = lock(&self.store).commit(&deltas, &dirty);
-        if result.is_err() {
-            let mut st = lock(&self.state);
-            for (k, v) in pending {
-                *st.pending.entry(k).or_default() += v;
-            }
-            st.dirty.extend(dirty.into_iter().map(|(id, _)| id));
-        }
-        result
+        lock(&self.store).prune_hosts(today, HOSTS_KEPT, HOSTS_PER_PROCESS)?;
+        lock(&self.state).hosts_pruned_before = today.to_string();
+        Ok(())
     }
 
     pub fn sources(&self) -> Vec<SourceView> {
@@ -445,8 +553,12 @@ impl Monitor {
 
     /// Traffic per source in `range`: what is in the database plus what is still pending.
     fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
-        let pending: Vec<(i64, Bytes)> =
-            lock(&self.state).pending.iter().filter(|((_, b), _)| range.contains(*b)).map(|((s, _), v)| (*s, *v)).collect();
+        let pending: Vec<(i64, Bytes)> = lock(&self.state)
+            .pending
+            .iter()
+            .filter(|((_, b, kind, _), _)| *kind == DimKind::Outbound && range.contains(*b))
+            .map(|((s, ..), v)| (*s, *v))
+            .collect();
         let mut out = lock(&self.store).sums_by_source(range)?;
         for (s, v) in pending {
             match out.iter_mut().find(|(id, _)| *id == s) {
@@ -462,8 +574,8 @@ impl Monitor {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
             .pending
             .iter()
-            .filter(|((s, b), _)| source.is_none_or(|x| x == *s) && range.contains(*b))
-            .map(|((_, b), v)| (*b, *v))
+            .filter(|((s, b, kind, _), _)| *kind == DimKind::Outbound && source.is_none_or(|x| x == *s) && range.contains(*b))
+            .map(|((_, b, ..), v)| (*b, *v))
             .collect();
         let mut rows = lock(&self.store).buckets(range, source)?;
         rows.extend(pending);
@@ -563,7 +675,8 @@ impl Monitor {
 
     /// The local dates of the first and last recorded traffic; `None` before any.
     pub fn bounds(&self, source: Option<i64>) -> Result<Option<Bounds>, String> {
-        let pending: Vec<i64> = lock(&self.state).pending.keys().filter(|(s, _)| source.is_none_or(|x| x == *s)).map(|(_, b)| *b).collect();
+        let pending: Vec<i64> =
+            lock(&self.state).pending.keys().filter(|(s, ..)| source.is_none_or(|x| x == *s)).map(|(_, b, ..)| *b).collect();
         let stored = lock(&self.store).bounds(source)?;
         let lo = stored.map(|(a, _)| a).into_iter().chain(pending.iter().copied()).min();
         let hi = stored.map(|(_, b)| b).into_iter().chain(pending.iter().copied()).max();
@@ -588,6 +701,78 @@ impl Monitor {
         Ok(days)
     }
 
+    /// The time span of the local days `from` through `to`.
+    fn days_range(&self, from: Date, to: Date) -> Result<Option<Range>, String> {
+        let days = period::periods(Period::Day, from, to, &TimeZone::system(), Weekday::Monday).map_err(|e| e.to_string())?;
+        Ok(days.first().zip(days.last()).map(|(a, b)| Range { start: a.1.start, end: b.1.end }))
+    }
+
+    /// Traffic per key of one dimension over the local days `from` through `to`, biggest first.
+    /// Dimensions other than the outbound one know only part of the traffic (and nothing before
+    /// per-connection collection began); the rest is listed under the empty key.
+    pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+        let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
+        let mut map: HashMap<String, Bytes> = HashMap::new();
+        for (key, b) in lock(&self.store).ranking(kind, range, source)? {
+            *map.entry(key).or_default() += b;
+        }
+        for ((s, bucket, k, key), b) in lock(&self.state).pending.iter() {
+            if *k == kind && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
+                *map.entry(key.clone()).or_default() += *b;
+            }
+        }
+        if kind != DimKind::Outbound {
+            let total = Prefix::new(self.buckets(range, source)?).sum(range);
+            let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
+            let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
+            *map.entry(String::new()).or_default() += rest;
+        }
+        Ok(ranked(map))
+    }
+
+    /// Hosts over the local days `from` through `to`, of one process or of all, biggest first;
+    /// past `limit` the rest is folded into the empty key. `merge` counts subdomains under their
+    /// registrable domain.
+    pub fn hosts(
+        &self,
+        from: Date,
+        to: Date,
+        source: Option<i64>,
+        process: Option<&str>,
+        merge: bool,
+        limit: usize,
+    ) -> Result<Vec<RankRow>, String> {
+        let (from, to) = (from.to_string(), to.to_string());
+        let mut rows: Vec<(String, String, Bytes)> =
+            lock(&self.store).hosts(&from, &to, source)?.into_iter().map(|h| (h.process, h.host, h.bytes)).collect();
+        for ((s, day, p, h), b) in lock(&self.state).pending_hosts.iter() {
+            if source.is_none_or(|x| x == *s) && *day >= from && *day <= to {
+                rows.push((p.clone(), h.clone(), *b));
+            }
+        }
+        let mut map: HashMap<String, Bytes> = HashMap::new();
+        for (p, h, b) in rows {
+            if process.is_some_and(|want| want != p) {
+                continue;
+            }
+            let key = if merge { split::registrable(&h).to_string() } else { h };
+            *map.entry(key).or_default() += b;
+        }
+        let mut all = ranked(map);
+        if all.len() > limit {
+            let rest = all.split_off(limit);
+            let folded = rest.iter().fold(Bytes::ZERO, |a, r| a + Bytes::new(r.up, r.down));
+            match all.iter_mut().find(|r| r.key.is_empty()) {
+                Some(r) => {
+                    r.up += folded.up;
+                    r.down += folded.down;
+                }
+                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down }),
+            }
+        }
+        Ok(all)
+    }
+
     /// Today's traffic of every source, for the tray.
     pub fn today(&self) -> Bytes {
         self.overview(None, false).map(|o| o.today).unwrap_or_default()
@@ -597,6 +782,26 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One reading of a core's counters (and a rate for the live chart), as the collector makes.
+    struct Reading {
+        totals: Bytes,
+        rate: Bytes,
+        at: i64,
+    }
+
+    trait Record {
+        fn record(&self, key: &str, id: i64, core: Option<&CoreId>, prev: Option<Bytes>, r: Reading) -> Option<LivePoint>;
+    }
+
+    impl Record for Monitor {
+        fn record(&self, key: &str, id: i64, core: Option<&CoreId>, prev: Option<Bytes>, r: Reading) -> Option<LivePoint> {
+            if !self.account(key, id, core, prev, r.totals, &[], r.at) {
+                return None;
+            }
+            self.live_point(key, id, r.rate, r.at)
+        }
+    }
 
     fn monitor_with_source() -> (Arc<Monitor>, i64) {
         let store = Store::open_in_memory();
@@ -706,6 +911,46 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn traffic_is_split_by_where_it_went() {
+        // Arrange: a baseline reading, then 1000 bytes down of which the connections account
+        // for 900 (a closed connection took the rest).
+        let (m, id) = monitor_with_source();
+        let at = noon().timestamp().as_second();
+        let dims = |outbound: &str, sub: &str, process: &str, host: &str| Dims {
+            outbound: outbound.into(),
+            subscription: sub.into(),
+            process: process.into(),
+            inbound: "DEFAULT-MIXED".into(),
+            host: host.into(),
+        };
+        m.account("a", id, None, None, Bytes::ZERO, &[], at);
+        let conns = [
+            (dims("HK 01", "白月光", "Chrome", "www.youtube.com"), Bytes::new(0, 600)),
+            (dims("HK 01", "白月光", "Chrome", "i.ytimg.com"), Bytes::new(0, 100)),
+            (dims("DIRECT", split::DIRECT, "Mail", "imap.qq.com"), Bytes::new(0, 200)),
+        ];
+        m.account("a", id, None, Some(Bytes::ZERO), Bytes::new(0, 1_000), &conns, at + 2);
+        // Rankings and hosts are by the system's local days.
+        let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
+        let rank = |kind| m.ranking(kind, today, today, Some(id)).unwrap().into_iter().map(|r| (r.key, r.down)).collect::<Vec<_>>();
+
+        // Act
+        let (outbound, subscription, process) = (rank(DimKind::Outbound), rank(DimKind::Subscription), rank(DimKind::Process));
+        m.flush().unwrap();
+        let after = rank(DimKind::Outbound);
+        let chrome = m.hosts(today, today, Some(id), Some("Chrome"), false, 10).unwrap();
+        let merged = m.hosts(today, today, Some(id), None, true, 1).unwrap();
+
+        // Assert
+        assert_eq!(outbound, vec![("HK 01".into(), 700), ("DIRECT".into(), 200), ("".into(), 100)]);
+        assert_eq!(subscription, vec![("白月光".into(), 700), (split::DIRECT.into(), 200), ("".into(), 100)]);
+        assert_eq!(process, vec![("Chrome".into(), 700), ("Mail".into(), 200), ("".into(), 100)]);
+        assert_eq!(after, outbound);
+        assert_eq!(chrome.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("www.youtube.com", 600), ("i.ytimg.com", 100)]);
+        assert_eq!(merged.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("youtube.com", 600), ("", 300)]);
     }
 
     #[test]

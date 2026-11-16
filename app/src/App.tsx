@@ -4,6 +4,7 @@ import { AppShell, type PageId } from "@/components/AppShell";
 import { api, type AppInfo, type Source } from "@/lib/api";
 import { useTheme } from "@/lib/theme";
 import { AboutPage } from "@/pages/AboutPage";
+import { BreakdownPage } from "@/pages/BreakdownPage";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { OverviewPage } from "@/pages/OverviewPage";
 import { SettingsPage } from "@/pages/SettingsPage";
@@ -36,6 +37,7 @@ export default function App() {
     <AppShell activePage={page} onPageChange={setPage} theme={theme} onThemeChange={setTheme} status={status}>
       {page === "overview" && <OverviewPage sources={sources} onOpenSources={() => setPage("sources")} />}
       {page === "history" && <HistoryPage sources={sources} />}
+      {page === "breakdown" && <BreakdownPage sources={sources} />}
       {page === "sources" && <SourcesPage sources={sources} />}
       {page === "settings" && <SettingsPage info={info} />}
       {page === "about" && <AboutPage info={info} />}

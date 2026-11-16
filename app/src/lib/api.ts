@@ -74,6 +74,13 @@ export interface Bounds {
   last: string;
 }
 
+export type DimKind = "outbound" | "subscription" | "process" | "inbound";
+
+/** One key of a ranking. The empty key is traffic that could not be attributed, or for hosts the many small ones folded together. */
+export interface RankRow extends Bytes {
+  key: string;
+}
+
 export interface ManualSource {
   name: string;
   url: string;
@@ -114,6 +121,9 @@ export const api = {
   overview: (source: number | null) => invoke<Overview>("overview", { source }),
   live: (source: number | null) => invoke<LivePoint[]>("live", { source }),
   history: (unit: PeriodUnit, from: string, to: string, source: number | null) => invoke<PeriodRow[]>("history", { unit, from, to, source }),
+  ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
+  hosts: (from: string, to: string, source: number | null, process: string | null, merge: boolean) =>
+    invoke<RankRow[]>("hosts", { from, to, source, process, merge }),
   dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
   topDays: (source: number | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, limit }),
   /** Opens a save dialog; false when the user cancelled it. */

@@ -6,6 +6,7 @@ pub mod paths;
 pub mod releases;
 pub mod settings;
 pub mod store;
+pub mod verge;
 
 /// reqwest is built with rustls but no bundled crypto provider (the updater plugin's choice);
 /// every client needs one installed first. Installing twice is harmless.

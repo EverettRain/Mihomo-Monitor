@@ -3,6 +3,7 @@
 //! `hub/route/server.go`); their file permissions are the access control.
 
 use crate::domain::counter::Bytes;
+use crate::domain::split::Conn;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,6 +126,12 @@ impl Client {
         Ok(v.version)
     }
 
+    /// The open connections and the core's counters, read at the same instant.
+    pub async fn connections(&self) -> Result<Snapshot, ApiError> {
+        let body = self.get("/connections").await?.bytes().await.map_err(unreachable)?;
+        parse_snapshot(&body).ok_or_else(|| ApiError::Unexpected("连接列表格式无法识别".into()))
+    }
+
     pub async fn traffic(&self) -> Result<TrafficStream, ApiError> {
         Ok(TrafficStream { resp: self.get("/traffic").await?, buf: Vec::new() })
     }
@@ -158,6 +165,68 @@ impl TrafficStream {
     }
 }
 
+/// A `/connections` snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub totals: Bytes,
+    pub conns: Vec<Conn>,
+}
+
+/// Parses a `/connections` body. Only the fields the statistics use are read.
+pub fn parse_snapshot(body: &[u8]) -> Option<Snapshot> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body {
+        upload_total: i64,
+        download_total: i64,
+        #[serde(default)]
+        connections: Option<Vec<Raw>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Raw {
+        id: String,
+        #[serde(default)]
+        upload: i64,
+        #[serde(default)]
+        download: i64,
+        #[serde(default)]
+        chains: Vec<String>,
+        #[serde(default)]
+        provider_chains: Vec<String>,
+        #[serde(default)]
+        metadata: Meta,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase", default)]
+    struct Meta {
+        process: String,
+        inbound_name: String,
+        host: String,
+        #[serde(rename = "destinationIP")]
+        destination_ip: String,
+    }
+    let b: Body = serde_json::from_slice(body).ok()?;
+    let n = |v: i64| v.max(0) as u64;
+    Some(Snapshot {
+        totals: Bytes::new(n(b.upload_total), n(b.download_total)),
+        conns: b
+            .connections
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| Conn {
+                id: c.id,
+                bytes: Bytes::new(n(c.upload), n(c.download)),
+                chains: c.chains,
+                provider_chains: c.provider_chains,
+                process: c.metadata.process,
+                inbound: c.metadata.inbound_name,
+                host: if c.metadata.host.is_empty() { c.metadata.destination_ip } else { c.metadata.host },
+            })
+            .collect(),
+    })
+}
+
 /// Parses one `/traffic` line; blank or foreign lines give `None`.
 pub fn parse_sample(line: &[u8]) -> Option<Sample> {
     #[derive(Deserialize)]
@@ -189,6 +258,37 @@ mod tests {
         // Assert
         assert_eq!(s.rate, Bytes::new(5250, 1602893));
         assert_eq!(s.totals, Some(Bytes::new(446992437, 5929316211)));
+    }
+
+    #[test]
+    fn parses_a_connections_snapshot() {
+        // Arrange: trimmed from a real mihomo v1.19.31 response.
+        let body = br#"{"downloadTotal":5929316211,"uploadTotal":446992437,"memory":1,"connections":[
+            {"id":"c1","metadata":{"network":"tcp","type":"Tun","sourceIP":"198.18.0.1","destinationIP":"142.250.1.1",
+             "host":"www.google.com","process":"Google Chrome","inboundName":"DEFAULT-TUN","sourcePort":"5000"},
+             "upload":10,"download":20,"start":"2026-11-16T08:00:00Z","chains":["HK 01","Proxy"],"providerChains":["",""],"rule":"Match"},
+            {"id":"c2","metadata":{"destinationIP":"1.1.1.1","host":""},"upload":1,"download":2,"chains":["DIRECT"]}
+        ]}"#;
+
+        // Act
+        let s = parse_snapshot(body).unwrap();
+
+        // Assert
+        assert_eq!(s.totals, Bytes::new(446992437, 5929316211));
+        assert_eq!(s.conns[0].process, "Google Chrome");
+        assert_eq!(s.conns[0].inbound, "DEFAULT-TUN");
+        assert_eq!(s.conns[0].chains, ["HK 01", "Proxy"]);
+        assert_eq!(s.conns[1].host, "1.1.1.1");
+        assert!(s.conns[1].provider_chains.is_empty());
+    }
+
+    #[test]
+    fn an_idle_core_lists_no_connections() {
+        // Act: mihomo writes null when nothing is open.
+        let s = parse_snapshot(br#"{"downloadTotal":1,"uploadTotal":2,"connections":null}"#).unwrap();
+
+        // Assert
+        assert!(s.conns.is_empty());
     }
 
     #[test]

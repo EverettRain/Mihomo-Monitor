@@ -33,6 +33,8 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 jiff = "1"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 yaml-rust2 = "0.13"
+# Registrable domain (eTLD+1) of a host, for merging subdomains in the views.
+psl = "2"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
