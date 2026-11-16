@@ -49,10 +49,11 @@ INBOUNDS = [("DEFAULT-MIXED", 0.7), ("DEFAULT-TUN", 0.3)]
 UNSEEN = 0.08
 
 
-def pick(options):
-    r = random.random() * sum(w for *_, w in options)
+def pick(options, weight):
+    """A random option, chosen in proportion to `weight(option)`."""
+    r = random.random() * sum(weight(o) for o in options)
     for o in options:
-        r -= o[-1]
+        r -= weight(o)
         if r <= 0:
             return o
     return options[-1]
@@ -69,12 +70,12 @@ class Core:
         self.started = time.time()
 
     def _open(self):
-        program, _, hosts = pick(PROGRAMS)
+        program, _, hosts = pick(PROGRAMS, lambda o: o[1])
         host = random.choice(hosts)
         if program in DIRECT_HOSTS:
             chains, providers = ["DIRECT"], [""]
         else:
-            node, provider, _ = pick(NODES)
+            node, provider, _ = pick(NODES, lambda o: o[2])
             chains, providers = [node, "节点选择"], [provider, ""]
         cid = f"{next(self.ids):08x}-demo"
         ip = host if host[0].isdigit() else f"198.18.0.{random.randint(2, 250)}"
@@ -87,7 +88,7 @@ class Core:
                 "destinationIP": ip,
                 "host": "" if host[0].isdigit() else host,
                 "process": program,
-                "inboundName": pick(INBOUNDS)[0],
+                "inboundName": pick(INBOUNDS, lambda o: o[1])[0],
             },
             "upload": 0,
             "download": 0,
