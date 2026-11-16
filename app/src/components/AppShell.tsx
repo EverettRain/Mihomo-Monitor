@@ -93,7 +93,7 @@ export function AppShell({ activePage, onPageChange, theme, onThemeChange, statu
 
   return (
     <div className="flex h-screen overflow-hidden bg-bg text-fg">
-      <aside className="flex w-[204px] shrink-0 flex-col border-r-[0.5px] border-line bg-bg">
+      <aside className="flex w-[228px] shrink-0 flex-col border-r-[0.5px] border-line bg-bg">
         <div data-tauri-drag-region className={cn("flex h-12 shrink-0 items-center gap-2", isMac ? "pl-[78px]" : "pl-4")}>
           <img src={appIcon} alt="" className="pointer-events-none h-[18px] w-[18px] rounded-[5px]" draggable={false} />
           <span className="pointer-events-none truncate text-[13.5px] font-semibold tracking-[0.01em]">Mihomo-Monitor</span>
