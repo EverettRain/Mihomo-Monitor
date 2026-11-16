@@ -1,0 +1,49 @@
+[package]
+name = "mihomo-monitor"
+version = "0.1.0"
+description = "Mihomo-Monitor - vnstat-style traffic statistics for the mihomo core you already run"
+license = "MIT"
+edition = "2021"
+rust-version = "1.95"
+
+[lib]
+name = "mihomo_monitor_lib"
+crate-type = ["staticlib", "rlib"]
+doctest = false
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
+tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The version Tauri and its updater already use; it reaches the core over unix sockets and
+# Windows named pipes as well as TCP. TLS (for GitHub release notes) as in the updater: rustls
+# with the ring provider, installed at start-up.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+jiff = "1"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+yaml-rust2 = "0.13"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "unwind"
+strip = "symbols"

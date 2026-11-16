@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mihomo-Monitor",
+  "version": "0.1.0",
+  "identifier": "local.mihomo-monitor",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:3027",
+    "beforeDevCommand": "pnpm run dev:renderer",
+    "beforeBuildCommand": "pnpm run build:renderer"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Mihomo-Monitor",
+        "create": false,
+        "decorations": false,
+        "width": 920,
+        "height": 620,
+        "minWidth": 760,
+        "minHeight": 500,
+        "resizable": true,
+        "center": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "Mihomo-Monitor",
+    "longDescription": "vnstat-style traffic statistics for the mihomo core you already run.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVCOTA2Nzk0QTAwQTI5MTgKUldRWUtRcWdsR2VRNjU3K2FXWWw3YXhsQ3htNDdwUk4zWkRHNHd6N2grK2ZtdThYOVhMV0xiMnkK",
+      "endpoints": [
+        "https://github.com/EverettRain/Mihomo-Monitor/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

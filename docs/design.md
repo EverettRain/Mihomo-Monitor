@@ -167,15 +167,13 @@ cycles      (id, subscription, anchor, quota_bytes, count_mode, alerts)
 
 ```text
 app/
-  src/                      React：pages/、components/（图表沿用 Hydra 的手写 SVG）、lib/api.ts
+  src/                      React：pages/、components/（图表为手写 SVG）、lib/api.ts
   src-tauri/src/
-    domain/                 纯逻辑：增量与重启判断、15 分钟分桶、周期计算、按时区归并
-    app/                    用例：采集服务、发现流程、各视图查询、配额提醒
-    infra/
-      mihomo/               API 客户端：TCP / unix socket / named pipe 上的 HTTP 与 WebSocket
-      discovery/            进程扫描 + 各客户端适配器
-      store.rs              SQLite
-    shell/                  Tauri：命令、托盘、窗口生命周期
+    domain/                 纯逻辑：counter（增量、重启与断点续算判断）、period（15 分钟分桶、按时区算日/周/月/年）
+    infra/                  对外适配：store（SQLite）、settings、mihomo（API 客户端，TCP / unix socket / named pipe）、
+                            discovery（进程扫描、启动参数与配置解析、Verge 已知位置）、releases（GitHub 更新说明）
+    service/                用例：discover（把候选内核逐个用 /version 验证）、monitor（采集、内存累加、定时落盘、各视图查询）
+    shell/                  Tauri：托盘、窗口生命周期（轻量模式）、命令
 ```
 
 ## 9. 里程碑
