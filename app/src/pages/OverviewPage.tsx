@@ -13,6 +13,8 @@ import { bytes, bytesShort, rate } from "@/lib/utils";
 
 /** Seconds shown in the live chart. */
 const LIVE_WINDOW = 300;
+/** Missing seconds bridged in the live chart. */
+const MAX_GAP = 2;
 const RANGES = [
   ["today", "今天"],
   [7, "7 天"],
@@ -45,9 +47,20 @@ function toSeries(points: LivePoint[], now: number): RatePoint[] {
     bySecond.set(p.at, v);
   }
   const out: RatePoint[] = [];
+  let last: { up: number; down: number } | null = null;
+  let missing = 0;
   for (let t = now - LIVE_WINDOW + 1; t <= now; t++) {
     const v = bySecond.get(t);
-    out.push({ at: t, up: v ? v.up : null, down: v ? v.down : null });
+    if (v) {
+      last = v;
+      missing = 0;
+    } else {
+      missing++;
+    }
+    // Readings arrive once a second but are stamped on arrival, so now and then a second has
+    // two and the next none; bridge such a hiccup, break the line only when the core is gone.
+    const shown = v ?? (last && missing <= MAX_GAP ? last : null);
+    out.push({ at: t, up: shown ? shown.up : null, down: shown ? shown.down : null });
   }
   return out;
 }
