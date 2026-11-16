@@ -61,8 +61,15 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
                 show_main(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon().cloned() {
-        tray = tray.icon(icon);
+    // The default window icon is the 32 px one, blurry in a Retina menu bar; the tray gets the
+    // 256 px artwork and scales it down itself.
+    match tauri::image::Image::from_bytes(include_bytes!("../../icons/128x128@2x.png")) {
+        Ok(icon) => tray = tray.icon(icon),
+        Err(_) => {
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+        }
     }
     tray.build(app)?;
     Ok(())
