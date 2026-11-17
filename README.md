@@ -254,7 +254,7 @@ attribution:
 | macOS | `~/Library/Application Support/Mihomo-Monitor` |
 | Windows | `%LOCALAPPDATA%\Mihomo-Monitor` |
 
-目录中有 `traffic.db`（SQLite，WAL 模式）、`settings.json` 与 `logs/`。可以用环境变量 `MIHOMO_MONITOR_HOME` 改用其他目录。数据库结构用 `PRAGMA user_version` 标记版本，升级时自动迁移。
+目录中有 `traffic.db`（SQLite，WAL 模式）、`settings.json` 与 `logs/`。可以用环境变量 `MIHOMO_MONITOR_HOME` 改用其他目录。数据库结构用 `PRAGMA user_version` 标记版本，升级时自动迁移。如果数据是更新的版本写入的（比如开发版用过同一个目录，旧的正式版又被打开），Mihomo-Monitor 不会打开这些数据，也不会开始统计，只显示一个「需要更新」的页面，可以直接在里面检查更新、下载安装并重启；数据保持原样，更新后照常使用。
 
 ## 开发
 

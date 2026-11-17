@@ -242,6 +242,14 @@ export interface AppInfo {
 }
 
 /** A published release and its markdown notes. */
+/** The statistics on disk were written by a later version; this build only offers to update. */
+export interface NewerData {
+  /** The data's schema version. */
+  found: number;
+  /** The newest this build reads. */
+  supported: number;
+}
+
 export interface ReleaseNote {
   version: string;
   date: string;
@@ -250,6 +258,8 @@ export interface ReleaseNote {
 
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
+  /** Set when the data comes from a later version; then no other command but updating may be used. */
+  newerData: () => invoke<NewerData | null>("newer_data"),
   getSettings: () => invoke<Settings>("get_settings"),
   setLightweight: (enabled: boolean) => invoke<void>("set_lightweight", { enabled }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

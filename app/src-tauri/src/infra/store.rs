@@ -17,7 +17,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 8;
+/// The newest schema this build reads and writes.
+pub const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -327,6 +328,17 @@ impl Store {
     #[cfg(test)]
     pub fn open_in_memory() -> Store {
         Self::init(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    /// The schema version of the database at `path` when it is newer than this build can read
+    /// (a later version of the app wrote it); the file is only looked at, not changed.
+    pub fn newer_schema(path: &Path) -> Result<Option<i32>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(path).map_err(err)?;
+        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(err)?;
+        Ok((version > SCHEMA_VERSION).then_some(version))
     }
 
     fn init(conn: Connection) -> Result<Store, String> {
@@ -1059,6 +1071,25 @@ mod tests {
         assert_eq!(direct, [("curl".into(), Bytes::new(0, 10)), ("Mail".into(), Bytes::new(0, 5))]);
         assert_eq!(every, [("curl".into(), Bytes::new(0, 40)), ("Mail".into(), Bytes::new(0, 5))]);
         assert_eq!(proxied_hosts.iter().map(|h| h.bytes.down).collect::<Vec<_>>(), [30]);
+    }
+
+    #[test]
+    fn a_database_from_a_later_version_is_told_apart_without_touching_it() {
+        // Arrange: no file, one this build wrote, and one a later version wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let (missing, current, later) = (dir.path().join("none.db"), dir.path().join("current.db"), dir.path().join("later.db"));
+        drop(Store::open(&current).unwrap());
+        Connection::open(&later).unwrap().pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+
+        // Act
+        let found = [&missing, &current, &later].map(|p| Store::newer_schema(p).unwrap());
+        let opened = Store::open(&later);
+
+        // Assert
+        assert_eq!(found, [None, None, Some(SCHEMA_VERSION + 1)]);
+        assert!(opened.is_err());
+        assert!(!missing.exists());
+        assert_eq!(Store::newer_schema(&later).unwrap(), Some(SCHEMA_VERSION + 1));
     }
 
     #[test]

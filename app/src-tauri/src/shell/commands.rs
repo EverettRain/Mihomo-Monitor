@@ -16,7 +16,7 @@ use crate::service::monitor::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager as _, State};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_opener::OpenerExt as _;
@@ -338,9 +338,19 @@ pub fn open_data_dir(app: AppHandle) -> Result<(), String> {
 
 /// Relaunches after an update was installed; the traffic still in memory is written first.
 #[tauri::command]
-pub fn restart_app(app: AppHandle, monitor: Mon) {
-    let _ = monitor.flush();
+pub fn restart_app(app: AppHandle) {
+    // Not running when the data comes from a later version (see `newer_data`).
+    if let Some(monitor) = app.try_state::<Arc<Monitor>>() {
+        let _ = monitor.flush();
+    }
     app.restart();
+}
+
+/// Set when the data on disk comes from a later version: then the app only offers to update,
+/// and no other command may be used.
+#[tauri::command]
+pub fn newer_data(app: AppHandle) -> Option<super::NewerData> {
+    app.try_state::<super::NewerData>().map(|s| *s)
 }
 
 #[derive(Serialize)]

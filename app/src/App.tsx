@@ -1,19 +1,33 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 import { AppShell, type PageId } from "@/components/AppShell";
-import { api, type AppInfo, type Source } from "@/lib/api";
+import { api, type AppInfo, type NewerData, type Source } from "@/lib/api";
 import { useTheme } from "@/lib/theme";
 import { AboutPage } from "@/pages/AboutPage";
 import { BreakdownPage } from "@/pages/BreakdownPage";
 import { AttributionPage } from "@/pages/AttributionPage";
 import { GroupsPage } from "@/pages/GroupsPage";
 import { HistoryPage } from "@/pages/HistoryPage";
+import { NewerDataPage } from "@/pages/NewerDataPage";
 import { OverviewPage } from "@/pages/OverviewPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { SourcesPage } from "@/pages/SourcesPage";
 import { SubscriptionsPage } from "@/pages/SubscriptionsPage";
 
+/**
+ * Asks first whether the data on disk comes from a later version: then only updating is offered,
+ * and none of the app's other commands are called.
+ */
 export default function App() {
+  const [newer, setNewer] = useState<NewerData | null | undefined>(undefined);
+  useEffect(() => {
+    api.newerData().then(setNewer, () => setNewer(null));
+  }, []);
+  if (newer === undefined) return null;
+  return newer ? <NewerDataPage data={newer} /> : <Main />;
+}
+
+function Main() {
   const [page, setPage] = useState<PageId>("overview");
   const [theme, setTheme] = useTheme();
   const [sources, setSources] = useState<Source[] | null>(null);

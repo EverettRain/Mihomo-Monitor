@@ -4,12 +4,25 @@ mod commands;
 mod tray;
 mod window;
 
-use crate::infra::{paths, settings, store::Store};
+use crate::infra::{
+    paths, settings,
+    store::{Store, SCHEMA_VERSION},
+};
 use crate::service::monitor::{Alert, Event, Monitor, FLUSH_EVERY};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_notification::NotificationExt as _;
+
+/// The database was written by a later version of the app; this one runs only to update itself.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewerData {
+    /// The schema version found.
+    pub found: i32,
+    /// The newest this build reads.
+    pub supported: i32,
+}
 
 /// Turns start-at-login on at the first launch: a traffic monitor only counts while it runs.
 /// Development builds leave it alone, so a debug binary never ends up in the login items.
@@ -90,6 +103,7 @@ pub fn run(start_in_tray: bool) {
         .on_window_event(window::on_event)
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
+            commands::newer_data,
             commands::get_settings,
             commands::set_lightweight,
             commands::set_autostart,
@@ -136,6 +150,16 @@ pub fn run(start_in_tray: bool) {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            // Data written by a later version (a development build, say) is left alone: this
+            // build only offers to update itself, so it can be updated at all rather than fail
+            // to start.
+            if let Some(found) = Store::newer_schema(&paths::database_path()).inspect_err(|e| paths::log(e))? {
+                paths::log(&format!("数据库版本 {found} 高于此版本支持的 {SCHEMA_VERSION}，只检查更新，不开始统计"));
+                app.manage(NewerData { found, supported: SCHEMA_VERSION });
+                tray::build(&handle)?;
+                window::show_main(&handle);
+                return Ok(());
+            }
             let store = Store::open(&paths::database_path()).inspect_err(|e| paths::log(e))?;
             let monitor = Monitor::new(store, sink(handle.clone()));
             monitor.set_sample_interval(settings::load().sample_ms);
