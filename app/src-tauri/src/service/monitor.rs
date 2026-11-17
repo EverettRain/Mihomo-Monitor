@@ -1478,14 +1478,20 @@ impl Monitor {
 
     /// Opens the configurations in `dir` and puts `wanted` in use, or the default one when it is
     /// gone. The first time, the groups and rules the database holds become the default
-    /// configuration, so nothing is lost. Returns the name in use.
+    /// configuration, so nothing is lost; with none, it is the one the app ships. Returns the
+    /// name in use.
     pub fn open_profiles(&self, dir: PathBuf, wanted: &str) -> Result<String, String> {
         let names = profiles::list(&dir);
         let name = if names.iter().any(|n| n == wanted) {
             wanted.to_string()
         } else {
             if !names.iter().any(|n| n == profiles::DEFAULT) {
-                profiles::write(&dir, profiles::DEFAULT, &self.export_rules_file()?)?;
+                let empty = {
+                    let store = lock(&self.store);
+                    store.host_groups()?.is_empty() && store.attribution_rules()?.is_empty()
+                };
+                let text = if empty { profiles::DEFAULT_TEXT.to_string() } else { self.export_rules_file()? };
+                profiles::write(&dir, profiles::DEFAULT, &text)?;
             }
             profiles::DEFAULT.to_string()
         };
@@ -2002,6 +2008,22 @@ mod tests {
         assert!(broken.error.is_some());
         assert_eq!(names(&m), ["A", "C"], "a file that cannot be read leaves the groups as they were");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "groups: [", "reading never writes the file back");
+    }
+
+    #[test]
+    fn a_new_installation_starts_with_the_shipped_default() {
+        // Arrange: no groups or rules yet.
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = monitor_with_source();
+
+        // Act
+        m.open_profiles(dir.path().to_path_buf(), profiles::DEFAULT).unwrap();
+
+        // Assert
+        let shipped = rules_file::parse(profiles::DEFAULT_TEXT).unwrap().0.groups.unwrap();
+        let names: Vec<String> = m.host_groups().unwrap().into_iter().map(|g| g.name).collect();
+        assert_eq!(names, shipped.iter().map(|g| g.name.clone()).collect::<Vec<_>>());
+        assert_eq!(std::fs::read_to_string(profiles::path_of(dir.path(), profiles::DEFAULT)).unwrap(), profiles::DEFAULT_TEXT);
     }
 
     #[test]

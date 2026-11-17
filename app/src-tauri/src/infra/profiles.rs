@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 /// The configuration every installation starts with.
 pub const DEFAULT: &str = "Default";
 
+/// What the default configuration holds on a new installation: groups for common services,
+/// kept as written, comments included.
+pub const DEFAULT_TEXT: &str = include_str!("../../defaults/Default.yaml");
+
 const EXT: &str = "yaml";
 
 /// Where the configurations of the data directory at `data` live.
@@ -80,6 +84,19 @@ mod tests {
         // Assert
         assert_eq!(ok, [true, true, true]);
         assert_eq!(bad, [false; 6]);
+    }
+
+    #[test]
+    fn the_shipped_default_reads_whole() {
+        // Act
+        let (file, problems) = crate::infra::rules_file::parse(DEFAULT_TEXT).unwrap();
+
+        // Assert
+        assert!(problems.is_empty(), "{problems:?}");
+        let groups = file.groups.unwrap();
+        assert!(groups.iter().all(|g| !g.rules.is_empty()));
+        let names: std::collections::HashSet<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names.len(), groups.len(), "group names are unique");
     }
 
     #[test]
