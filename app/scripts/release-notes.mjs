@@ -7,11 +7,22 @@
 // trailers (Co-Authored-By, …) and commits that leave the app untouched (README, docs, CI,
 // these scripts) are left out. The markdown is what the in-app update dialog
 // renders, and what tauri-action writes to the release and to latest.json.
+//
+// A hand-written docs/releases/<tag>.md, when there is one, is used as it is instead: for a
+// release whose commits read badly as notes, such as the first, which would list the whole
+// development history.
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 
 const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
 const tag = process.argv[2];
 if (!tag) throw new Error("usage: release-notes.mjs <tag> [previous-tag]");
+
+const written = new URL(`../../docs/releases/${tag}.md`, import.meta.url);
+if (existsSync(written)) {
+  process.stdout.write(`${readFileSync(written, "utf8").trim()}\n`);
+  process.exit(0);
+}
 
 let prev = process.argv[3];
 if (!prev) {
