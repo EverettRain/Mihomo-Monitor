@@ -1,10 +1,12 @@
-import { ChevronRight, Loader2 } from "lucide-react";
+import { ChevronRight, FolderPlus, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AddToGroupDialog } from "@/components/AddToGroupDialog";
 import { Page, PageHeader } from "@/components/PageHeader";
 import { Segmented } from "@/components/Segmented";
+import { Tag } from "@/components/Tag";
+import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
-import { api, errorText, type DimKind, type RankRow, type Source } from "@/lib/api";
+import { api, errorText, type DimKind, type HostView, type RankRow, type Source } from "@/lib/api";
 import { bytes, cn, isoDate } from "@/lib/utils";
 
 type Tab = DimKind | "host";
@@ -67,8 +69,14 @@ const HINTS: Record<Tab, string> = {
     "节点来自哪个订阅：配置里用了 proxy-providers 时取 provider 名；Clash Verge Rev 取当时启用的配置名。直连不属于任何订阅。",
   process: "发起连接的程序。内核需要能查到进程：TUN 模式下通常默认可以，否则在配置中设置 find-process-mode: always。",
   inbound: "流量从内核的哪个入口进来，例如混合端口、TUN，或为容器、局域网设备单独开的端口。",
-  host: "访问的域名（没有域名时是 IP）。今天的数据完整；过去的每一天只保留用量最高的 200 个，其余计入「其他」。",
+  host: "访问的域名（没有域名时是 IP）。今天的数据完整；过去的每一天只保留用量最高的 200 个，其余计入「其他」。按分组查看时，属于同一分组的域名与 IP 合并为分组名称，分组在「域名分组」页管理；点行末的按钮可以把一个域名加入分组。",
 };
+
+const VIEWS: readonly (readonly [HostView, string])[] = [
+  ["group", "按分组"],
+  ["domain", "按主域名"],
+  ["host", "原始"],
+];
 
 function Bar({ value, max }: { value: number; max: number }) {
   return (
@@ -87,6 +95,7 @@ function Row({
   open,
   onToggle,
   indent,
+  onAdd,
 }: {
   tab: Tab;
   row: RankRow;
@@ -96,44 +105,86 @@ function Row({
   open?: boolean;
   onToggle?: () => void;
   indent?: boolean;
+  /** Offers to put this host into a group. */
+  onAdd?: () => void;
 }) {
   const v = row.up + row.down;
   const { text, muted } = keyLabel(tab, row.key);
-  const Tag = expandable ? "button" : "div";
   return (
-    <Tag
+    <div
+      role={expandable ? "button" : undefined}
+      tabIndex={expandable ? 0 : undefined}
       onClick={expandable ? onToggle : undefined}
+      onKeyDown={expandable ? (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onToggle?.()) : undefined}
       aria-expanded={expandable ? open : undefined}
       title={`下载 ${bytes(row.down)} · 上传 ${bytes(row.up)}`}
       className={cn(
-        "grid w-full grid-cols-[minmax(0,1fr)_minmax(80px,30%)_5.5rem_3.25rem] items-center gap-3 px-4 py-1.5 text-left text-[12.5px] active:!scale-100",
-        expandable && "hover:bg-pill/60",
+        "group grid w-full grid-cols-[minmax(0,1fr)_minmax(80px,28%)_5.5rem_3.25rem_1.75rem] items-center gap-3 py-1.5 pl-4 pr-2 text-left text-[12.5px] outline-none",
+        expandable && "cursor-pointer hover:bg-pill/60 focus-visible:bg-pill/60",
         indent && "py-1 text-[12px]",
       )}
     >
-      <span className={cn("flex min-w-0 items-center gap-1", indent && "pl-5")}>
+      <span className={cn("flex min-w-0 items-center gap-1.5", indent && "pl-5")}>
         {expandable && <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted transition-transform", open && "rotate-90")} />}
-        <span className={cn("selectable truncate", muted ? "text-muted" : "text-fg", indent && "text-fg-2")}>{text}</span>
+        <span className={cn("selectable truncate", muted ? "text-muted" : "text-fg", indent && !row.group && "text-fg-2")}>{text}</span>
+        {row.group && <Tag>分组</Tag>}
       </span>
       <Bar value={v} max={max} />
       <span className="text-right font-mono tabular-nums">{bytes(v)}</span>
       <span className="text-right font-mono tabular-nums text-muted">{total > 0 ? `${((v / total) * 100).toFixed(1)}%` : "—"}</span>
-    </Tag>
+      <span className="flex h-[18px] items-center justify-end">
+        {onAdd && row.key && !row.group && (
+          <Button
+            variant="ghost"
+            size="iconSm"
+            aria-label={`把 ${row.key} 加入分组`}
+            title="加入分组"
+            className="h-[22px] w-[22px] opacity-0 focus-visible:opacity-100 group-hover:opacity-100 [&_svg]:h-3.5 [&_svg]:w-3.5"
+            onClick={(e) => {
+              e.stopPropagation();
+              onAdd();
+            }}
+          >
+            <FolderPlus />
+          </Button>
+        )}
+      </span>
+    </div>
   );
 }
 
-function ProcessHosts({ process, from, to, source, merge }: { process: string; from: string; to: string; source: number | null; merge: boolean }) {
+/** Hosts under an expanded row: a process's hosts, or a group's members. */
+function SubHosts({
+  from,
+  to,
+  source,
+  process,
+  group,
+  view,
+  onAdd,
+  version,
+}: {
+  from: string;
+  to: string;
+  source: number | null;
+  process: string | null;
+  group: string | null;
+  view: HostView;
+  onAdd: (host: string) => void;
+  /** Changes when groups change, to read again. */
+  version: number;
+}) {
   const [rows, setRows] = useState<RankRow[] | null>(null);
   useEffect(() => {
     let active = true;
-    api.hosts(from, to, source, process, merge).then(
+    api.hosts(from, to, source, process, group, view).then(
       (r) => active && setRows(r),
       () => active && setRows([]),
     );
     return () => {
       active = false;
     };
-  }, [process, from, to, source, merge]);
+  }, [process, group, from, to, source, view, version]);
   if (!rows) return <div className="px-4 py-1.5 pl-9 text-[12px] text-muted">正在读取…</div>;
   if (!rows.length) return <div className="px-4 py-1.5 pl-9 text-[12px] text-muted">没有记录到域名</div>;
   const total = rows.reduce((t, r) => t + r.up + r.down, 0);
@@ -141,7 +192,7 @@ function ProcessHosts({ process, from, to, source, merge }: { process: string; f
   return (
     <div className="bg-card-2 py-1">
       {rows.slice(0, 15).map((r) => (
-        <Row key={r.key} tab="host" row={r} total={total} max={max} indent />
+        <Row key={`${r.group}${r.key}`} tab="host" row={r} total={total} max={max} indent onAdd={() => onAdd(r.key)} />
       ))}
     </div>
   );
@@ -151,7 +202,9 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
   const [tab, setTab] = useState<Tab>("outbound");
   const [range, setRange] = useState<RangeId>("today");
   const [source, setSource] = useState<number | null>(null);
-  const [merge, setMerge] = useState(true);
+  const [view, setView] = useState<HostView>("group");
+  const [adding, setAdding] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
   const [weekStartsSunday, setWeekStartsSunday] = useState(false);
   const [rows, setRows] = useState<RankRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -167,12 +220,12 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
 
   const load = useCallback(async () => {
     try {
-      setRows(tab === "host" ? await api.hosts(from, to, source, null, merge) : await api.ranking(tab, from, to, source));
+      setRows(tab === "host" ? await api.hosts(from, to, source, null, null, view) : await api.ranking(tab, from, to, source));
       setError(null);
     } catch (e) {
       setError(errorText(e));
     }
-  }, [tab, from, to, source, merge]);
+  }, [tab, from, to, source, view]);
 
   useEffect(() => {
     setRows(null);
@@ -225,10 +278,9 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
               {rows && <span>{rows.filter((r) => r.key).length} 项</span>}
               {error && <span className="text-danger">{error}</span>}
               {tab === "host" && (
-                <label className="ml-auto flex items-center gap-2">
-                  按主域名合并
-                  <Switch label="按主域名合并" checked={merge} onCheckedChange={setMerge} />
-                </label>
+                <span className="ml-auto">
+                  <Segmented label="域名的显示方式" value={view} onChange={setView} options={VIEWS} />
+                </span>
               )}
             </div>
             {onlyUnknown && (
@@ -245,20 +297,36 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
               <p className="py-8 text-center text-[12px] text-muted">这段时间没有记录</p>
             ) : (
               <div>
-                {shown.map((r) => (
-                  <div key={r.key}>
-                    <Row
-                      tab={tab}
-                      row={r}
-                      total={total}
-                      max={max}
-                      expandable={tab === "process"}
-                      open={open === r.key}
-                      onToggle={() => setOpen((o) => (o === r.key ? null : r.key))}
-                    />
-                    {tab === "process" && open === r.key && <ProcessHosts process={r.key} from={from} to={to} source={source} merge={merge} />}
-                  </div>
-                ))}
+                {shown.map((r) => {
+                  const id = `${r.group ? "g:" : ""}${r.key}`;
+                  const expands = tab === "process" || (tab === "host" && !!r.group);
+                  return (
+                    <div key={id}>
+                      <Row
+                        tab={tab}
+                        row={r}
+                        total={total}
+                        max={max}
+                        expandable={expands}
+                        open={open === id}
+                        onToggle={() => setOpen((o) => (o === id ? null : id))}
+                        onAdd={tab === "host" ? () => setAdding(r.key) : undefined}
+                      />
+                      {expands && open === id && (
+                        <SubHosts
+                          from={from}
+                          to={to}
+                          source={source}
+                          process={tab === "process" ? r.key : null}
+                          group={tab === "host" ? r.key : null}
+                          view={tab === "host" ? "host" : view}
+                          onAdd={setAdding}
+                          version={version}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
                 {!all && (rows?.length ?? 0) > SHOWN && (
                   <button className="w-full px-4 py-2 text-left text-[12px] text-muted hover:text-fg active:!scale-100" onClick={() => setAll(true)}>
                     显示全部 {rows?.length} 项
@@ -270,6 +338,14 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
         </section>
         <p className="px-1 text-[11.5px] leading-relaxed text-muted">{HINTS[tab]}</p>
       </div>
+      <AddToGroupDialog
+        host={adding}
+        onClose={() => setAdding(null)}
+        onDone={() => {
+          setVersion((v) => v + 1);
+          void load();
+        }}
+      />
     </Page>
   );
 }

@@ -148,7 +148,7 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
     const what = VIEWS.find(([v]) => v === view)?.[1] ?? view;
     const span = view === "top" ? `前${TOP_N}天` : from === to ? from : `${from}_${to}`;
     try {
-      if (await api.exportCsv(`mihomo-monitor-${what}-${span}.csv`, csv(rows, now))) toast("已导出");
+      if (await api.exportFile(`mihomo-monitor-${what}-${span}.csv`, csv(rows, now), true)) toast("已导出");
     } catch (e) {
       toast(errorText(e), "error");
     } finally {

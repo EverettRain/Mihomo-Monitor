@@ -7,13 +7,14 @@
 
 use crate::domain::counter::{Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{CountMode, Reset};
+use crate::domain::hostgroup::{Rule, RuleKind};
 use crate::domain::period::Range;
 use crate::domain::split::DimKind;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -74,6 +75,57 @@ CREATE TABLE meta (
 const SCHEMA_V3: &str = "
 CREATE UNIQUE INDEX cycles_subscription ON cycles (subscription);
 ";
+
+/// Host groups and their entries. Groups take precedence in the order they were created.
+const SCHEMA_V4: &str = "
+CREATE TABLE host_groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE host_rules (
+    id INTEGER PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    UNIQUE (group_id, kind, value)
+);
+";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRuleRow {
+    pub id: i64,
+    #[serde(flatten)]
+    pub rule: Rule,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostGroupRow {
+    pub id: i64,
+    pub name: String,
+    pub note: String,
+    pub rules: Vec<HostRuleRow>,
+}
+
+/// What an import or an addition changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Added {
+    pub groups: usize,
+    pub rules: usize,
+    /// Entries the group already had.
+    pub duplicates: usize,
+}
+
+fn unique_name_err(e: rusqlite::Error, name: &str) -> String {
+    match e {
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => format!("已经有名为“{name}”的分组。"),
+        e => err(e),
+    }
+}
 
 /// A subscription's billing cycle as configured.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -454,6 +506,111 @@ impl Store {
         self.conn.execute("DELETE FROM cycles WHERE id = ?1", [id]).map(|_| ()).map_err(err)
     }
 
+    /// Every group with its entries, in order of precedence.
+    pub fn host_groups(&self) -> Result<Vec<HostGroupRow>, String> {
+        let mut groups: Vec<HostGroupRow> = {
+            let mut stmt = self.conn.prepare("SELECT id, name, note FROM host_groups ORDER BY id").map_err(err)?;
+            let rows = stmt
+                .query_map([], |r| Ok(HostGroupRow { id: r.get(0)?, name: r.get(1)?, note: r.get(2)?, rules: Vec::new() }))
+                .map_err(err)?;
+            rows.collect::<Result<_, _>>().map_err(err)?
+        };
+        let mut stmt = self.conn.prepare("SELECT id, group_id, kind, value FROM host_rules ORDER BY group_id, kind, value").map_err(err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))
+            .map_err(err)?;
+        for row in rows {
+            let (id, group, kind, value) = row.map_err(err)?;
+            let (Some(g), Some(kind)) = (groups.iter_mut().find(|g| g.id == group), RuleKind::parse(&kind)) else { continue };
+            g.rules.push(HostRuleRow { id, rule: Rule { kind, value } });
+        }
+        Ok(groups)
+    }
+
+    pub fn create_group(&self, name: &str, note: &str, now: i64) -> Result<i64, String> {
+        self.conn
+            .query_row("INSERT INTO host_groups (name, note, created_at) VALUES (?1, ?2, ?3) RETURNING id", params![name, note, now], |r| {
+                r.get(0)
+            })
+            .map_err(|e| unique_name_err(e, name))
+    }
+
+    pub fn update_group(&self, id: i64, name: &str, note: &str) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE host_groups SET name = ?2, note = ?3 WHERE id = ?1", params![id, name, note])
+            .map(|_| ())
+            .map_err(|e| unique_name_err(e, name))
+    }
+
+    pub fn delete_group(&mut self, id: i64) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        tx.execute("DELETE FROM host_rules WHERE group_id = ?1", [id]).map_err(err)?;
+        tx.execute("DELETE FROM host_groups WHERE id = ?1", [id]).map_err(err)?;
+        tx.commit().map_err(err)
+    }
+
+    /// Adds entries to a group; ones it already has are counted, not repeated.
+    pub fn add_rules(&mut self, group: i64, rules: &[Rule]) -> Result<Added, String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        let added = insert_rules(&tx, group, rules)?;
+        tx.commit().map_err(err)?;
+        Ok(added)
+    }
+
+    pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE host_rules SET kind = ?2, value = ?3 WHERE id = ?1", params![id, rule.kind.as_str(), rule.value])
+            .map(|_| ())
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    "这个分组里已经有相同的条目。".to_string()
+                }
+                e => err(e),
+            })
+    }
+
+    pub fn delete_rules(&mut self, ids: &[i64]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        for id in ids {
+            tx.execute("DELETE FROM host_rules WHERE id = ?1", [id]).map_err(err)?;
+        }
+        tx.commit().map_err(err)
+    }
+
+    /// Adds `(group name, entry)` pairs in one transaction, creating groups that do not exist.
+    pub fn import_rules(&mut self, entries: &[(String, Rule)], now: i64) -> Result<Added, String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        let mut total = Added::default();
+        let mut by_group: Vec<(String, Vec<Rule>)> = Vec::new();
+        for (g, r) in entries {
+            match by_group.iter_mut().find(|(name, _)| name == g) {
+                Some((_, list)) => list.push(r.clone()),
+                None => by_group.push((g.clone(), vec![r.clone()])),
+            }
+        }
+        for (name, rules) in by_group {
+            let existing: Option<i64> =
+                tx.query_row("SELECT id FROM host_groups WHERE name = ?1", [&name], |r| r.get(0)).optional().map_err(err)?;
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    total.groups += 1;
+                    tx.query_row(
+                        "INSERT INTO host_groups (name, note, created_at) VALUES (?1, '', ?2) RETURNING id",
+                        params![name, now],
+                        |r| r.get(0),
+                    )
+                    .map_err(err)?
+                }
+            };
+            let added = insert_rules(&tx, id, &rules)?;
+            total.rules += added.rules;
+            total.duplicates += added.duplicates;
+        }
+        tx.commit().map_err(err)?;
+        Ok(total)
+    }
+
     pub fn meta(&self, key: &str) -> Result<Option<String>, String> {
         self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(err)
     }
@@ -461,6 +618,19 @@ impl Store {
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
         self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![key, value]).map(|_| ()).map_err(err)
     }
+}
+
+fn insert_rules(tx: &rusqlite::Transaction, group: i64, rules: &[Rule]) -> Result<Added, String> {
+    let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO host_rules (group_id, kind, value) VALUES (?1, ?2, ?3)").map_err(err)?;
+    let mut added = Added::default();
+    for r in rules {
+        if stmt.execute(params![group, r.kind.as_str(), r.value]).map_err(err)? == 1 {
+            added.rules += 1;
+        } else {
+            added.duplicates += 1;
+        }
+    }
+    Ok(added)
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {
@@ -476,6 +646,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     }
     if version < 3 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;")).map_err(err)?;
+    }
+    if version < 4 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V4} PRAGMA user_version = 4; COMMIT;")).map_err(err)?;
     }
     Ok(())
 }
@@ -647,6 +820,31 @@ mod tests {
         assert_eq!(id, again);
         assert_eq!(saved, vec![CycleRow { id: Some(id), ..c }]);
         assert!(store.cycles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_groups_keep_unique_names_and_entries() {
+        // Arrange
+        let mut store = Store::open_in_memory();
+        let yt = store.create_group("YouTube", "", 0).unwrap();
+        let suffix = |v: &str| Rule::new(RuleKind::Suffix, v).unwrap();
+
+        // Act
+        let added = store.add_rules(yt, &[suffix("youtube.com"), suffix("ytimg.com"), suffix("youtube.com")]).unwrap();
+        let duplicate_name = store.create_group("YouTube", "", 0);
+        let imported = store.import_rules(&[("YouTube".into(), suffix("ytimg.com")), ("Telegram".into(), suffix("t.me"))], 1).unwrap();
+        let groups = store.host_groups().unwrap();
+        let first = groups[0].rules[0].id;
+        let clash = store.update_rule(first, &suffix("ytimg.com"));
+        store.delete_group(groups[1].id).unwrap();
+
+        // Assert
+        assert_eq!(added, Added { groups: 0, rules: 2, duplicates: 1 });
+        assert!(duplicate_name.unwrap_err().contains("YouTube"));
+        assert_eq!(imported, Added { groups: 1, rules: 1, duplicates: 1 });
+        assert_eq!(groups.iter().map(|g| (g.name.as_str(), g.rules.len())).collect::<Vec<_>>(), [("YouTube", 2), ("Telegram", 1)]);
+        assert!(clash.is_err());
+        assert_eq!(store.host_groups().unwrap().len(), 1);
     }
 
     #[test]

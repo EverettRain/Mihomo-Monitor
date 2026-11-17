@@ -79,6 +79,55 @@ export type DimKind = "outbound" | "subscription" | "process" | "inbound";
 /** One key of a ranking. The empty key is traffic that could not be attributed, or for hosts the many small ones folded together. */
 export interface RankRow extends Bytes {
   key: string;
+  /** The key is a host group's name. */
+  group?: boolean;
+}
+
+/** How hosts are listed: as connected to, under their registrable domain, or under their group. */
+export type HostView = "host" | "domain" | "group";
+
+/** Clash's matching rules: exact domain, domain with subdomains, keyword, address or range. */
+export type RuleKind = "domain" | "suffix" | "keyword" | "cidr";
+
+export interface HostRule {
+  id: number;
+  kind: RuleKind;
+  value: string;
+}
+
+export interface HostGroup {
+  id: number;
+  name: string;
+  note: string;
+  rules: HostRule[];
+}
+
+export interface Added {
+  groups: number;
+  rules: number;
+  duplicates: number;
+}
+
+export interface ImportProblem {
+  /** 1-based line or item; 0 when there is none. */
+  at: number;
+  text: string;
+  reason: string;
+}
+
+export type ImportFormat = "auto" | "text" | "csv" | "json" | "yaml";
+
+export interface ImportEntry {
+  /** null goes to the group chosen for the import. */
+  group: string | null;
+  kind: RuleKind;
+  value: string;
+}
+
+export interface ImportPreview {
+  format: ImportFormat;
+  entries: ImportEntry[];
+  problems: ImportProblem[];
 }
 
 /** When a billing cycle starts over (local time, quarter hours). */
@@ -168,15 +217,26 @@ export const api = {
   live: (source: number | null) => invoke<LivePoint[]>("live", { source }),
   history: (unit: PeriodUnit, from: string, to: string, source: number | null) => invoke<PeriodRow[]>("history", { unit, from, to, source }),
   ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
-  hosts: (from: string, to: string, source: number | null, process: string | null, merge: boolean) =>
-    invoke<RankRow[]>("hosts", { from, to, source, process, merge }),
+  hosts: (from: string, to: string, source: number | null, process: string | null, group: string | null, view: HostView) =>
+    invoke<RankRow[]>("hosts", { from, to, source, process, group, view }),
+  hostGroups: () => invoke<HostGroup[]>("host_groups"),
+  createGroup: (name: string, note: string) => invoke<number>("create_group", { name, note }),
+  updateGroup: (id: number, name: string, note: string) => invoke<void>("update_group", { id, name, note }),
+  deleteGroup: (id: number) => invoke<void>("delete_group", { id }),
+  /** Entries one per line, read as a text import. */
+  addRules: (group: number, text: string) => invoke<{ added: Added; problems: ImportProblem[] }>("add_rules", { group, text }),
+  updateRule: (id: number, kind: RuleKind, value: string) => invoke<void>("update_rule", { id, kind, value }),
+  deleteRules: (ids: number[]) => invoke<void>("delete_rules", { ids }),
+  importPreview: (text: string, format: ImportFormat) => invoke<ImportPreview>("import_preview", { text, format }),
+  importApply: (entries: ImportEntry[], defaultGroup: string) => invoke<Added>("import_apply", { entries, defaultGroup }),
+  exportGroups: () => invoke<string>("export_groups"),
   subscriptions: () => invoke<Subscription[]>("subscriptions"),
   saveCycle: (cycle: CycleConfig) => invoke<number>("save_cycle", { cycle }),
   deleteCycle: (id: number) => invoke<void>("delete_cycle", { id }),
   dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
   topDays: (source: number | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, limit }),
-  /** Opens a save dialog; false when the user cancelled it. */
-  exportCsv: (name: string, content: string) => invoke<boolean>("export_csv", { name, content }),
+  /** Opens a save dialog and writes CSV or JSON; false when the user cancelled it. */
+  exportFile: (name: string, content: string, csv: boolean) => invoke<boolean>("export_file", { name, content, csv }),
   releaseNotes: (after: string, upto: string) => invoke<ReleaseNote[]>("release_notes", { after, upto }),
   openReleasePage: (version: string) => invoke<void>("open_release_page", { version }),
   openDataDir: () => invoke<void>("open_data_dir"),

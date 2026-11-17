@@ -2,5 +2,6 @@
 
 pub mod counter;
 pub mod cycle;
+pub mod hostgroup;
 pub mod period;
 pub mod split;

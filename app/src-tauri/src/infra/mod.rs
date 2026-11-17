@@ -1,6 +1,7 @@
 //! Adapters to the outside world: storage, settings, the mihomo API, the process list.
 
 pub mod discovery;
+pub mod import;
 pub mod mihomo;
 pub mod paths;
 pub mod releases;

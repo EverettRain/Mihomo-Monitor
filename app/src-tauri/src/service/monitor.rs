@@ -7,10 +7,12 @@
 use super::discover::{self, Discovery, Found};
 use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{self, Reported};
+use crate::domain::hostgroup::{Matcher, Rule, RuleKind};
 use crate::domain::period::{self, bucket_of, Period, Range};
 use crate::domain::split::{self, DimKind, Dims, Tracker};
+use crate::infra::import::{self, Entry, Format, Parsed, Problem};
 use crate::infra::mihomo::Client;
-use crate::infra::store::{BucketDelta, CycleRow, HostDelta, Store};
+use crate::infra::store::{Added, BucketDelta, CycleRow, HostDelta, HostGroupRow, Store};
 use crate::infra::{discovery, paths, settings, verge};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
@@ -201,13 +203,49 @@ pub struct RankRow {
     pub key: String,
     pub up: u64,
     pub down: u64,
+    /// The key is a host group's name rather than a host.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub group: bool,
 }
 
 fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
+    ranked_marked(map.into_iter().map(|(k, b)| ((k, false), b)).collect())
+}
+
+fn ranked_marked(map: HashMap<(String, bool), Bytes>) -> Vec<RankRow> {
     let mut rows: Vec<RankRow> =
-        map.into_iter().filter(|(_, b)| !b.is_zero()).map(|(key, b)| RankRow { key, up: b.up, down: b.down }).collect();
+        map.into_iter().filter(|(_, b)| !b.is_zero()).map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group }).collect();
     rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)));
     rows
+}
+
+/// How hosts are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostView {
+    /// As connected to.
+    Host,
+    /// Under their registrable domain.
+    Domain,
+    /// Under their host group's name; hosts in no group under their registrable domain.
+    Group,
+}
+
+/// What the entries typed or pasted into a group added, and the lines that could not be read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddResult {
+    pub added: Added,
+    pub problems: Vec<Problem>,
+}
+
+fn group_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    match name.chars().count() {
+        0 => Err("请填写分组名称。".into()),
+        n if n > 60 => Err("分组名称最多 60 个字。".into()),
+        _ => Ok(name.to_string()),
+    }
 }
 
 /// Local dates holding the first and the last recorded traffic.
@@ -282,6 +320,8 @@ pub struct Monitor {
     sink: Box<dyn Fn(Event) + Send + Sync>,
     /// Runs discovery again right away (a core went away, the user added one).
     wake: Notify,
+    /// Host groups compiled for matching; rebuilt after they change.
+    matcher: Mutex<Option<Arc<Matcher>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -307,7 +347,13 @@ impl Monitor {
                 },
             );
         }
-        Arc::new(Monitor { store: Mutex::new(store), state: Mutex::new(state), sink: Box::new(sink), wake: Notify::new() })
+        Arc::new(Monitor {
+            store: Mutex::new(store),
+            state: Mutex::new(state),
+            sink: Box::new(sink),
+            wake: Notify::new(),
+            matcher: Mutex::new(None),
+        })
     }
 
     pub fn rediscover(&self) {
@@ -893,13 +939,15 @@ impl Monitor {
     /// Hosts over the local days `from` through `to`, of one process or of all, biggest first;
     /// past `limit` the rest is folded into the empty key. `merge` counts subdomains under their
     /// registrable domain.
+    #[allow(clippy::too_many_arguments)]
     pub fn hosts(
         &self,
         from: Date,
         to: Date,
         source: Option<i64>,
         process: Option<&str>,
-        merge: bool,
+        in_group: Option<&str>,
+        view: HostView,
         limit: usize,
     ) -> Result<Vec<RankRow>, String> {
         let (from, to) = (from.to_string(), to.to_string());
@@ -910,27 +958,118 @@ impl Monitor {
                 rows.push((p.clone(), h.clone(), *b));
             }
         }
-        let mut map: HashMap<String, Bytes> = HashMap::new();
+        let matcher = if view == HostView::Group || in_group.is_some() { Some(self.matcher()?) } else { None };
+        let mut map: HashMap<(String, bool), Bytes> = HashMap::new();
         for (p, h, b) in rows {
             if process.is_some_and(|want| want != p) {
                 continue;
             }
-            let key = if merge { split::registrable(&h).to_string() } else { h };
+            let group = matcher.as_ref().and_then(|m| m.group_of(&h));
+            if in_group.is_some() && group != in_group {
+                continue;
+            }
+            let key = match (view, group) {
+                (HostView::Group, Some(g)) if in_group.is_none() => (g.to_string(), true),
+                (HostView::Host, _) => (h, false),
+                _ => (split::registrable(&h).to_string(), false),
+            };
             *map.entry(key).or_default() += b;
         }
-        let mut all = ranked(map);
+        let mut all = ranked_marked(map);
         if all.len() > limit {
             let rest = all.split_off(limit);
             let folded = rest.iter().fold(Bytes::ZERO, |a, r| a + Bytes::new(r.up, r.down));
-            match all.iter_mut().find(|r| r.key.is_empty()) {
+            match all.iter_mut().find(|r| r.key.is_empty() && !r.group) {
                 Some(r) => {
                     r.up += folded.up;
                     r.down += folded.down;
                 }
-                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down }),
+                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down, group: false }),
             }
         }
         Ok(all)
+    }
+
+    fn matcher(&self) -> Result<Arc<Matcher>, String> {
+        if let Some(m) = lock(&self.matcher).as_ref() {
+            return Ok(m.clone());
+        }
+        let groups: Vec<(String, Vec<Rule>)> =
+            lock(&self.store).host_groups()?.into_iter().map(|g| (g.name, g.rules.into_iter().map(|r| r.rule).collect())).collect();
+        let m = Arc::new(Matcher::new(&groups));
+        *lock(&self.matcher) = Some(m.clone());
+        Ok(m)
+    }
+
+    /// Runs a change to the host groups and drops the compiled matcher.
+    fn change_groups<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
+        let result = f(&mut lock(&self.store));
+        *lock(&self.matcher) = None;
+        result
+    }
+
+    pub fn host_groups(&self) -> Result<Vec<HostGroupRow>, String> {
+        lock(&self.store).host_groups()
+    }
+
+    pub fn create_group(&self, name: &str, note: &str) -> Result<i64, String> {
+        let name = group_name(name)?;
+        self.change_groups(|s| s.create_group(&name, note.trim(), paths::now_secs()))
+    }
+
+    pub fn update_group(&self, id: i64, name: &str, note: &str) -> Result<(), String> {
+        let name = group_name(name)?;
+        self.change_groups(|s| s.update_group(id, &name, note.trim()))
+    }
+
+    pub fn delete_group(&self, id: i64) -> Result<(), String> {
+        self.change_groups(|s| s.delete_group(id))
+    }
+
+    /// Adds entries typed or pasted into a group, one per line, read as in a text import.
+    pub fn add_rules(&self, group: i64, text: &str) -> Result<AddResult, String> {
+        let parsed = import::parse(text, Format::Text);
+        let rules: Vec<Rule> = parsed.entries.into_iter().map(|e| e.rule).collect();
+        let added = self.change_groups(|s| s.add_rules(group, &rules))?;
+        Ok(AddResult { added, problems: parsed.problems })
+    }
+
+    pub fn update_rule(&self, id: i64, kind: RuleKind, value: &str) -> Result<(), String> {
+        let rule = Rule::new(kind, value)?;
+        self.change_groups(|s| s.update_rule(id, &rule))
+    }
+
+    pub fn delete_rules(&self, ids: &[i64]) -> Result<(), String> {
+        self.change_groups(|s| s.delete_rules(ids))
+    }
+
+    pub fn import_preview(&self, text: &str, format: Format) -> Parsed {
+        import::parse(text, format)
+    }
+
+    /// Adds previewed entries; those naming no group go to `default_group`.
+    pub fn import_apply(&self, entries: Vec<Entry>, default_group: &str) -> Result<Added, String> {
+        let fallback = if entries.iter().any(|e| e.group.is_none()) { Some(group_name(default_group)?) } else { None };
+        let mut pairs = Vec::with_capacity(entries.len());
+        for e in entries {
+            let name = match e.group {
+                Some(g) => group_name(&g)?,
+                None => fallback.clone().unwrap_or_default(),
+            };
+            // Entries from the page are checked again rather than trusted.
+            pairs.push((name, Rule::new(e.rule.kind, &e.rule.value)?));
+        }
+        self.change_groups(|s| s.import_rules(&pairs, paths::now_secs()))
+    }
+
+    /// Every group as JSON that `import` reads back.
+    pub fn export_groups(&self) -> Result<String, String> {
+        let groups: Vec<serde_json::Value> = lock(&self.store)
+            .host_groups()?
+            .into_iter()
+            .map(|g| serde_json::json!({"name": g.name, "note": g.note, "rules": g.rules.into_iter().map(|r| r.rule).collect::<Vec<_>>()}))
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({ "groups": groups })).map_err(|e| e.to_string())
     }
 
     /// Today's traffic of every source, for the tray.
@@ -1101,8 +1240,12 @@ mod tests {
         let (outbound, subscription, process) = (rank(DimKind::Outbound), rank(DimKind::Subscription), rank(DimKind::Process));
         m.flush().unwrap();
         let after = rank(DimKind::Outbound);
-        let chrome = m.hosts(today, today, Some(id), Some("Chrome"), false, 10).unwrap();
-        let merged = m.hosts(today, today, Some(id), None, true, 1).unwrap();
+        let chrome = m.hosts(today, today, Some(id), Some("Chrome"), None, HostView::Host, 10).unwrap();
+        let merged = m.hosts(today, today, Some(id), None, None, HostView::Domain, 1).unwrap();
+        let yt = m.create_group("YouTube", "").unwrap();
+        m.add_rules(yt, "+.youtube.com\nytimg.com").unwrap();
+        let grouped = m.hosts(today, today, Some(id), None, None, HostView::Group, 10).unwrap();
+        let members = m.hosts(today, today, Some(id), None, Some("YouTube"), HostView::Host, 10).unwrap();
 
         // Assert
         assert_eq!(outbound, vec![("HK 01".into(), 700), ("DIRECT".into(), 200), ("".into(), 100)]);
@@ -1111,6 +1254,11 @@ mod tests {
         assert_eq!(after, outbound);
         assert_eq!(chrome.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("www.youtube.com", 600), ("i.ytimg.com", 100)]);
         assert_eq!(merged.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("youtube.com", 600), ("", 300)]);
+        assert_eq!(
+            grouped.iter().map(|r| (r.key.as_str(), r.down, r.group)).collect::<Vec<_>>(),
+            [("YouTube", 700, true), ("qq.com", 200, false)]
+        );
+        assert_eq!(members.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["www.youtube.com", "i.ytimg.com"]);
     }
 
     #[test]

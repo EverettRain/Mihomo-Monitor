@@ -1,14 +1,18 @@
 //! Tauri commands the interface calls.
 
 use super::tray;
+use crate::domain::hostgroup::RuleKind;
 use crate::domain::period::Period;
 use crate::domain::split::DimKind;
 use crate::infra::discovery::controller_url;
+use crate::infra::import::{Entry, Format, Parsed};
 use crate::infra::paths;
 use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
-use crate::infra::store::CycleRow;
-use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView, SubscriptionView};
+use crate::infra::store::{Added, CycleRow, HostGroupRow};
+use crate::service::monitor::{
+    AddResult, Bounds, HostView, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView, SubscriptionView,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -131,7 +135,7 @@ pub fn ranking(monitor: Mon, kind: DimKind, from: String, to: String, source: Op
     monitor.ranking(kind, date(&from)?, date(&to)?, source)
 }
 
-/// Hosts most traffic went to; `process` narrows them to one process.
+/// Hosts most traffic went to; `process` narrows them to one process, `group` to one host group.
 #[tauri::command]
 pub fn hosts(
     monitor: Mon,
@@ -139,9 +143,60 @@ pub fn hosts(
     to: String,
     source: Option<i64>,
     process: Option<String>,
-    merge: bool,
+    group: Option<String>,
+    view: HostView,
 ) -> Result<Vec<RankRow>, String> {
-    monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), merge, 100)
+    monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), group.as_deref(), view, 100)
+}
+
+#[tauri::command]
+pub fn host_groups(monitor: Mon) -> Result<Vec<HostGroupRow>, String> {
+    monitor.host_groups()
+}
+
+#[tauri::command]
+pub fn create_group(monitor: Mon, name: String, note: String) -> Result<i64, String> {
+    monitor.create_group(&name, &note)
+}
+
+#[tauri::command]
+pub fn update_group(monitor: Mon, id: i64, name: String, note: String) -> Result<(), String> {
+    monitor.update_group(id, &name, &note)
+}
+
+#[tauri::command]
+pub fn delete_group(monitor: Mon, id: i64) -> Result<(), String> {
+    monitor.delete_group(id)
+}
+
+#[tauri::command]
+pub fn add_rules(monitor: Mon, group: i64, text: String) -> Result<AddResult, String> {
+    monitor.add_rules(group, &text)
+}
+
+#[tauri::command]
+pub fn update_rule(monitor: Mon, id: i64, kind: RuleKind, value: String) -> Result<(), String> {
+    monitor.update_rule(id, kind, &value)
+}
+
+#[tauri::command]
+pub fn delete_rules(monitor: Mon, ids: Vec<i64>) -> Result<(), String> {
+    monitor.delete_rules(&ids)
+}
+
+#[tauri::command]
+pub fn import_preview(monitor: Mon, text: String, format: Format) -> Parsed {
+    monitor.import_preview(&text, format)
+}
+
+#[tauri::command]
+pub fn import_apply(monitor: Mon, entries: Vec<Entry>, default_group: String) -> Result<Added, String> {
+    monitor.import_apply(entries, &default_group)
+}
+
+#[tauri::command]
+pub fn export_groups(monitor: Mon) -> Result<String, String> {
+    monitor.export_groups()
 }
 
 #[tauri::command]
@@ -169,17 +224,20 @@ pub fn top_days(monitor: Mon, source: Option<i64>, limit: usize) -> Result<Vec<P
     monitor.top_days(source, limit.min(100))
 }
 
-/// Asks where to save and writes the CSV there. The page hands over only the text; the path
-/// comes from the save dialog, so no page code can write elsewhere. `false` when cancelled.
+/// Asks where to save and writes the text there, as CSV or JSON. The page hands over only the
+/// text; the path comes from the save dialog, so no page code can write elsewhere. `false` when
+/// cancelled.
 #[tauri::command]
-pub async fn export_csv(app: AppHandle, name: String, content: String) -> Result<bool, String> {
+pub async fn export_file(app: AppHandle, name: String, content: String, csv: bool) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(path) = app.dialog().file().set_file_name(&name).add_filter("CSV", &["csv"]).blocking_save_file() else {
+        let (label, ext) = if csv { ("CSV", "csv") } else { ("JSON", "json") };
+        let Some(path) = app.dialog().file().set_file_name(&name).add_filter(label, &[ext]).blocking_save_file() else {
             return Ok(false);
         };
         let path = path.into_path().map_err(|e| e.to_string())?;
         // With a byte-order mark, Excel opens UTF-8 CSV with Chinese text correctly.
-        std::fs::write(&path, format!("\u{feff}{content}")).map_err(|e| format!("无法保存：{e}"))?;
+        let body = if csv { format!("\u{feff}{content}") } else { content };
+        std::fs::write(&path, body).map_err(|e| format!("无法保存：{e}"))?;
         Ok(true)
     })
     .await

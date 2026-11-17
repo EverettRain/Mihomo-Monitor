@@ -1,13 +1,13 @@
 import { UpdateNotice } from "./UpdateNotice";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { CalendarRange, ChartPie, Cpu, LayoutDashboard, Ticket, Info, Minus, Moon, Settings, Square, Sun, SunMoon, X } from "lucide-react";
+import { CalendarRange, ChartPie, Cpu, LayoutDashboard, Tags, Ticket, Info, Minus, Moon, Settings, Square, Sun, SunMoon, X } from "lucide-react";
 import type React from "react";
 import { useLayoutEffect, useRef, useState } from "react";
 import appIcon from "@/assets/app-icon.png";
 import type { ThemeMode } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
-export type PageId = "overview" | "history" | "breakdown" | "subscriptions" | "sources" | "settings" | "about";
+export type PageId = "overview" | "history" | "breakdown" | "groups" | "subscriptions" | "sources" | "settings" | "about";
 
 type Icon = React.ComponentType<{ className?: string }>;
 interface NavItem { id: PageId; label: string; icon: Icon }
@@ -17,6 +17,7 @@ const main: NavItem[] = [
   { id: "overview", label: "概览", icon: LayoutDashboard },
   { id: "history", label: "历史", icon: CalendarRange },
   { id: "breakdown", label: "分布", icon: ChartPie },
+  { id: "groups", label: "域名分组", icon: Tags },
   { id: "subscriptions", label: "订阅", icon: Ticket },
   { id: "sources", label: "内核", icon: Cpu },
 ];
@@ -24,7 +25,7 @@ const footer: NavItem[] = [
   { id: "settings", label: "设置", icon: Settings },
   { id: "about", label: "关于", icon: Info },
 ];
-const titles: Record<PageId, string> = { overview: "概览", history: "历史", breakdown: "分布", subscriptions: "订阅", sources: "内核", settings: "设置", about: "关于" };
+const titles: Record<PageId, string> = { overview: "概览", history: "历史", breakdown: "分布", groups: "域名分组", subscriptions: "订阅", sources: "内核", settings: "设置", about: "关于" };
 
 const nextTheme: Record<ThemeMode, ThemeMode> = { system: "light", light: "dark", dark: "system" };
 const themeLabel: Record<ThemeMode, string> = { system: "跟随系统", light: "浅色", dark: "深色" };
