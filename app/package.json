@@ -1,6 +1,6 @@
 {
   "name": "mihomo-monitor",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Mihomo-Monitor - long-term traffic statistics for the mihomo core you already run",
   "type": "module",
