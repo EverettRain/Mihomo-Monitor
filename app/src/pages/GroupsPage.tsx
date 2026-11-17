@@ -1,14 +1,14 @@
-import { Download, FolderPlus, Loader2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
+import { ChevronLeft, Download, FolderPlus, Loader2, Pencil, Plus, Search, Tags, Trash2, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ImportDialog } from "@/components/ImportDialog";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
+import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type HostGroup, type HostRule, type RuleKind } from "@/lib/api";
 import { KIND_LABEL, KINDS } from "@/lib/hostgroup";
-import { cn } from "@/lib/utils";
 
 /** Creates a group, or renames one and edits its note. */
 function GroupDialog({ group, open, onClose, onSaved }: { group: HostGroup | null; open: boolean; onClose: () => void; onSaved: (id: number) => void }) {
@@ -117,7 +117,28 @@ function RuleRow({ rule, onChanged }: { rule: HostRule; onChanged: () => void })
   );
 }
 
-function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup; onChanged: () => void; onEdit: () => void; onImport: () => void }) {
+function GroupIcon() {
+  return (
+    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] bg-pill text-fg-2">
+      <Tags className="h-4 w-4" />
+    </span>
+  );
+}
+
+/** A group's own page: its header with the way back, then adding and editing its entries. */
+function GroupEditor({
+  group,
+  onChanged,
+  onEdit,
+  onImport,
+  onBack,
+}: {
+  group: HostGroup;
+  onChanged: () => void;
+  onEdit: () => void;
+  onImport: () => void;
+  onBack: () => void;
+}) {
   const toast = useToast();
   const [text, setText] = useState("");
   const [filter, setFilter] = useState("");
@@ -128,6 +149,15 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
     setText("");
     setFilter("");
   }, [group.id]);
+
+  // Escape goes back to the list, unless a dialog is open (it closes first).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !document.querySelector("[data-dialog-layer]")) onBack();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onBack]);
 
   const add = async () => {
     setBusy(true);
@@ -156,27 +186,32 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
 
   return (
     <div className="space-y-5">
-      <Group
-        label={<span className="normal-case">{group.name}</span>}
-        action={
-          <div className="flex items-center gap-1">
-            <Button size="sm" variant="ghost" onClick={onImport}>
-              <Upload />
-              导入到此分组
-            </Button>
-            <Button size="sm" variant="ghost" onClick={onEdit}>
-              <Pencil />
-              编辑
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setConfirmDelete(true)}>
-              <Trash2 />
-              删除
-            </Button>
+      <div className="flex items-center gap-2.5 rounded-xl bg-card px-3 py-3 shadow-card">
+        <Button size="iconSm" variant="ghost" aria-label="返回分组列表" title="返回分组列表（Esc）" onClick={onBack}>
+          <ChevronLeft />
+        </Button>
+        <GroupIcon />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-[13.5px] font-semibold">{group.name}</span>
+            <Tag>{group.rules.length} 条</Tag>
           </div>
-        }
-      >
+          {group.note && <div className="truncate text-[11.5px] text-muted">{group.note}</div>}
+        </div>
+        <Button size="sm" variant="outline" onClick={onImport}>
+          <Upload />
+          导入到此分组
+        </Button>
+        <Button size="iconSm" variant="ghost" aria-label="改名或备注" title="改名或备注" onClick={onEdit}>
+          <Pencil />
+        </Button>
+        <Button size="iconSm" variant="ghost" aria-label="删除分组" title="删除分组" onClick={() => setConfirmDelete(true)}>
+          <Trash2 />
+        </Button>
+      </div>
+
+      <Group label="添加条目">
         <div className="space-y-2 px-4 py-3">
-          {group.note && <p className="text-[12.5px] text-muted">{group.note}</p>}
           <Textarea
             aria-label="添加条目"
             value={text}
@@ -184,7 +219,7 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) void add();
             }}
-            placeholder={"添加条目，每行一条，例如：\nyoutube.com\n91.108.4.0/22"}
+            placeholder={"每行一条，例如：\nyoutube.com\n91.108.4.0/22"}
             className="min-h-[76px] font-mono"
           />
           <div className="flex items-center justify-between gap-3">
@@ -229,7 +264,13 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
               variant="destructive"
               onClick={() => {
                 setConfirmDelete(false);
-                void api.deleteGroup(group.id).then(onChanged, (e) => toast(errorText(e), "error"));
+                void api.deleteGroup(group.id).then(
+                  () => {
+                    onBack();
+                    onChanged();
+                  },
+                  (e) => toast(errorText(e), "error"),
+                );
               }}
             >
               删除
@@ -252,7 +293,8 @@ export function GroupsPage() {
     try {
       const g = await api.hostGroups();
       setGroups(g);
-      setSelected((s) => (s !== null && g.some((x) => x.id === s) ? s : (g[0]?.id ?? null)));
+      // A group deleted elsewhere closes its page.
+      setSelected((s) => (s !== null && g.some((x) => x.id === s) ? s : null));
     } catch (e) {
       toast(errorText(e), "error");
     }
@@ -271,6 +313,32 @@ export function GroupsPage() {
   };
 
   const current = groups?.find((g) => g.id === selected) ?? null;
+  const back = useCallback(() => setSelected(null), []);
+
+  if (current) {
+    return (
+      <Page>
+        <h1 className="sr-only">{current.name}</h1>
+        <div key={current.id} className="view-in px-5 pt-3">
+          <GroupEditor
+            group={current}
+            onChanged={() => void load()}
+            onEdit={() => setEditing({ open: true, group: current })}
+            onImport={() => setImporting({ open: true, preset: current.id })}
+            onBack={back}
+          />
+        </div>
+        <GroupDialog open={editing.open} group={editing.group} onClose={() => setEditing({ open: false, group: null })} onSaved={() => void load()} />
+        <ImportDialog
+          open={importing.open}
+          groups={groups ?? []}
+          preset={importing.preset}
+          onClose={() => setImporting({ open: false, preset: null })}
+          onDone={() => void load()}
+        />
+      </Page>
+    );
+  }
 
   return (
     <Page>
@@ -315,37 +383,25 @@ export function GroupsPage() {
             </div>
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="rounded-xl bg-card p-3 shadow-card">
-              <div role="tablist" aria-label="分组" className="flex gap-0.5 overflow-x-auto rounded-lg bg-pill p-0.5">
-                {groups.map((g) => (
-                  <button
-                    key={g.id}
-                    role="tab"
-                    aria-selected={g.id === selected}
-                    onClick={() => setSelected(g.id)}
-                    className={cn(
-                      "flex h-7 min-w-[72px] shrink-0 flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-[12.5px] active:!scale-100",
-                      g.id === selected ? "bg-card font-medium text-fg shadow-edge dark:bg-white/[.12]" : "text-muted hover:text-fg",
-                    )}
-                  >
-                    {g.name}
-                    <span className="font-mono text-[10.5px] tabular-nums text-faint">{g.rules.length}</span>
-                  </button>
-                ))}
+          <Group label={`分组（${groups.length}）`}>
+            {groups.map((g) => (
+              <div key={g.id} className="flex items-center gap-3 px-4 py-3">
+                <GroupIcon />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-[13.5px] font-medium">{g.name}</span>
+                    <Tag>{g.rules.length} 条</Tag>
+                  </div>
+                  <div className="truncate text-[11.5px] text-muted">
+                    {g.note || (g.rules.length ? g.rules.slice(0, 4).map((r) => r.value).join("、") + (g.rules.length > 4 ? " 等" : "") : "还没有条目")}
+                  </div>
+                </div>
+                <Button size="sm" variant="outline" onClick={() => setSelected(g.id)}>
+                  编辑
+                </Button>
               </div>
-            </div>
-            {current && (
-              <div key={current.id} className="view-in">
-                <GroupDetail
-                  group={current}
-                  onChanged={() => void load()}
-                  onEdit={() => setEditing({ open: true, group: current })}
-                  onImport={() => setImporting({ open: true, preset: current.id })}
-                />
-              </div>
-            )}
-          </div>
+            ))}
+          </Group>
         )}
         <p className="mt-5 px-1 text-[11.5px] leading-relaxed text-muted">
           条目的匹配方式与 Clash 规则相同：「仅此域名」只匹配这个域名，「域名及子域名」还包括它的所有子域名，「包含关键字」匹配域名里含有这段文字的，「IP / 网段」匹配地址。
