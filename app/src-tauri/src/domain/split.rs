@@ -4,9 +4,10 @@
 //! mihomo lists the open connections with their own byte counters. Between two snapshots a
 //! connection's growth is attributed to its dimensions. Connections that closed in between take
 //! their last bytes with them, so the core's total grows by more than the connections we saw;
-//! that remainder is "unattributed" (the empty key). The outbound and route splits always add up
-//! to the total; the other dimensions keep only what they know, and the views derive their
-//! remainder.
+//! that remainder is "unattributed" (the empty key). Every row also carries its route, through a
+//! proxy or not, so each dimension can be read for one route alone; the remainder has no route.
+//! The outbound split always adds up to the total; the other dimensions keep only what they know,
+//! and the views derive their remainder.
 //! A connection without a value for a dimension is kept under that dimension's empty key: for
 //! processes, that is traffic the core saw but could not tie to a program, apart from the
 //! remainder no connection accounts for.
@@ -20,20 +21,17 @@ use std::collections::HashMap;
 #[serde(rename_all = "lowercase")]
 pub enum DimKind {
     Outbound,
-    /// Through a proxy or not: keys `proxy` and `direct`.
-    Route,
     Subscription,
     Process,
     Inbound,
 }
 
 impl DimKind {
-    pub const ALL: [DimKind; 5] = [DimKind::Outbound, DimKind::Route, DimKind::Subscription, DimKind::Process, DimKind::Inbound];
+    pub const ALL: [DimKind; 4] = [DimKind::Outbound, DimKind::Subscription, DimKind::Process, DimKind::Inbound];
 
     pub fn as_str(self) -> &'static str {
         match self {
             DimKind::Outbound => "outbound",
-            DimKind::Route => "route",
             DimKind::Subscription => "subscription",
             DimKind::Process => "process",
             DimKind::Inbound => "inbound",
@@ -45,7 +43,7 @@ impl DimKind {
 pub const DIRECT: &str = "DIRECT";
 
 /// Whether traffic went out through a proxy. Traffic no connection accounts for has no route
-/// (the empty key).
+/// (stored as the empty route).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
@@ -177,13 +175,34 @@ impl Tracker {
     }
 }
 
+/// A dimension's key, and the route its traffic took (empty when unknown).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DimKey {
+    pub kind: DimKind,
+    pub key: String,
+    pub route: String,
+}
+
+impl DimKey {
+    pub fn new(kind: DimKind, key: &str, route: &str) -> DimKey {
+        DimKey { kind, key: key.into(), route: route.into() }
+    }
+}
+
+/// A host its process reached, and the route the traffic took.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostKey {
+    pub process: String,
+    pub host: String,
+    pub route: String,
+}
+
 /// Traffic of one interval, by dimension.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Split {
-    /// Per kind and key. Outbound includes the unattributed remainder under "".
-    pub dims: HashMap<(DimKind, String), Bytes>,
-    /// Per (process, host).
-    pub hosts: HashMap<(String, String), Bytes>,
+    /// Outbound includes the unattributed remainder under the empty key and route.
+    pub dims: HashMap<DimKey, Bytes>,
+    pub hosts: HashMap<HostKey, Bytes>,
 }
 
 fn sub(a: u64, b: u64) -> u64 {
@@ -198,19 +217,17 @@ pub fn split(total: Bytes, deltas: &[(Dims, Bytes)]) -> Split {
         seen += *b;
         for (kind, key) in [
             (DimKind::Outbound, &d.outbound),
-            (DimKind::Route, &d.route),
             (DimKind::Subscription, &d.subscription),
             (DimKind::Process, &d.process),
             (DimKind::Inbound, &d.inbound),
         ] {
-            *s.dims.entry((kind, key.clone())).or_default() += *b;
+            *s.dims.entry(DimKey::new(kind, key, &d.route)).or_default() += *b;
         }
-        *s.hosts.entry((d.process.clone(), d.host.clone())).or_default() += *b;
+        *s.hosts.entry(HostKey { process: d.process.clone(), host: d.host.clone(), route: d.route.clone() }).or_default() += *b;
     }
     let rest = Bytes::new(sub(total.up, seen.up), sub(total.down, seen.down));
     if !rest.is_zero() {
-        *s.dims.entry((DimKind::Outbound, String::new())).or_default() += rest;
-        *s.dims.entry((DimKind::Route, String::new())).or_default() += rest;
+        *s.dims.entry(DimKey::new(DimKind::Outbound, "", "")).or_default() += rest;
     }
     s.dims.retain(|_, v| !v.is_zero());
     s
@@ -239,6 +256,16 @@ mod tests {
             inbound: "DEFAULT-MIXED".into(),
             host: "example.com".into(),
         }
+    }
+
+    /// What a split holds for one kind and key, over every route.
+    fn of(s: &Split, kind: DimKind, key: &str) -> Bytes {
+        s.dims.iter().filter(|(k, _)| k.kind == kind && k.key == key).fold(Bytes::ZERO, |a, (_, v)| a + *v)
+    }
+
+    /// What a split holds for one kind, over every key, in one route.
+    fn in_route(s: &Split, kind: DimKind, route: &str) -> Bytes {
+        s.dims.iter().filter(|(k, _)| k.kind == kind && k.route == route).fold(Bytes::ZERO, |a, (_, v)| a + *v)
     }
 
     #[test]
@@ -317,13 +344,13 @@ mod tests {
         let s = split(Bytes::new(100, 1_000), &[(hk, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
 
         // Assert
-        let outbound: Bytes = s.dims.iter().filter(|((k, _), _)| *k == DimKind::Outbound).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+        let outbound: Bytes = s.dims.iter().filter(|(k, _)| k.kind == DimKind::Outbound).fold(Bytes::ZERO, |a, (_, v)| a + *v);
         assert_eq!(outbound, Bytes::new(100, 1_000));
-        assert_eq!(s.dims[&(DimKind::Outbound, String::new())], Bytes::new(60, 300));
-        assert_eq!(s.dims[&(DimKind::Subscription, "白月光".into())], Bytes::new(30, 600));
-        assert_eq!(s.dims[&(DimKind::Subscription, DIRECT.into())], Bytes::new(10, 100));
-        assert_eq!(s.hosts[&("Safari".into(), "example.com".into())], Bytes::new(40, 700));
-        assert!(!s.dims.contains_key(&(DimKind::Process, String::new())));
+        assert_eq!(s.dims[&DimKey::new(DimKind::Outbound, "", "")], Bytes::new(60, 300));
+        assert_eq!(s.dims[&DimKey::new(DimKind::Subscription, "白月光", "proxy")], Bytes::new(30, 600));
+        assert_eq!(s.dims[&DimKey::new(DimKind::Subscription, DIRECT, "direct")], Bytes::new(10, 100));
+        assert_eq!(s.hosts.values().fold(Bytes::ZERO, |a, v| a + *v), Bytes::new(40, 700));
+        assert_eq!(of(&s, DimKind::Process, ""), Bytes::ZERO);
     }
 
     #[test]
@@ -349,24 +376,25 @@ mod tests {
         let by = |rules: &Attributor| -> Vec<(Dims, Bytes)> {
             conns.iter().zip(grown).map(|(c, b)| (dims_of(c, None, rules, &OutboundTypes::new()), b)).collect()
         };
-        let sum = |s: &Split, kind: DimKind| s.dims.iter().filter(|((k, _), _)| *k == kind).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+        let sum = |s: &Split, kind: DimKind| s.dims.iter().filter(|(k, _)| k.kind == kind).fold(Bytes::ZERO, |a, (_, v)| a + *v);
 
         // Act
         let plain = split(total, &by(&Attributor::default()));
         let named = split(total, &by(&rules));
 
         // Assert
-        assert_eq!(named.dims[&(DimKind::Process, "Container: us-workstation".into())], Bytes::new(20, 300));
-        assert_eq!(named.dims[&(DimKind::Process, "Safari".into())], Bytes::new(10, 100));
-        assert_eq!(named.dims[&(DimKind::Process, String::new())], Bytes::new(5, 50));
-        assert_eq!(plain.dims[&(DimKind::Process, String::new())], Bytes::new(25, 350));
+        assert_eq!(of(&named, DimKind::Process, "Container: us-workstation"), Bytes::new(20, 300));
+        assert_eq!(of(&named, DimKind::Process, "Safari"), Bytes::new(10, 100));
+        assert_eq!(of(&named, DimKind::Process, ""), Bytes::new(5, 50));
+        assert_eq!(of(&plain, DimKind::Process, ""), Bytes::new(25, 350));
         for kind in DimKind::ALL {
             assert_eq!(sum(&named, kind), sum(&plain, kind), "{kind:?}");
         }
         assert_eq!(sum(&named, DimKind::Outbound), total);
         let hosts = |s: &Split| s.hosts.values().fold(Bytes::ZERO, |a, v| a + *v);
         assert_eq!(hosts(&named), hosts(&plain));
-        assert_eq!(named.hosts[&("Container: us-workstation".into(), "example.com".into())], Bytes::new(20, 300));
+        let container = HostKey { process: "Container: us-workstation".into(), host: "example.com".into(), route: "proxy".into() };
+        assert_eq!(named.hosts[&container], Bytes::new(20, 300));
     }
 
     #[test]
@@ -401,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn the_route_split_adds_up_to_the_total_like_the_outbound_one() {
+    fn every_dimension_is_split_by_route_and_the_remainder_has_none() {
         // Arrange
         let none = OutboundTypes::new();
         let proxied = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), None, &Attributor::default(), &none);
@@ -412,11 +440,13 @@ mod tests {
         let s = split(total, &[(proxied, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
 
         // Assert
-        let route: Bytes = s.dims.iter().filter(|((k, _), _)| *k == DimKind::Route).fold(Bytes::ZERO, |a, (_, v)| a + *v);
-        assert_eq!(route, total);
-        assert_eq!(s.dims[&(DimKind::Route, "proxy".into())], Bytes::new(30, 600));
-        assert_eq!(s.dims[&(DimKind::Route, "direct".into())], Bytes::new(10, 100));
-        assert_eq!(s.dims[&(DimKind::Route, String::new())], Bytes::new(60, 300));
+        for kind in DimKind::ALL {
+            assert_eq!(in_route(&s, kind, "proxy"), Bytes::new(30, 600), "{kind:?}");
+            assert_eq!(in_route(&s, kind, "direct"), Bytes::new(10, 100), "{kind:?}");
+        }
+        assert_eq!(in_route(&s, DimKind::Outbound, ""), Bytes::new(60, 300));
+        let hosts = |route: &str| s.hosts.iter().filter(|(k, _)| k.route == route).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+        assert_eq!((hosts("proxy"), hosts("direct")), (Bytes::new(30, 600), Bytes::new(10, 100)));
     }
 
     #[test]

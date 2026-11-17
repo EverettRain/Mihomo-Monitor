@@ -102,6 +102,7 @@ pub fn run(start_in_tray: bool) {
             commands::live,
             commands::history,
             commands::ranking,
+            commands::routes,
             commands::hosts,
             commands::data_bounds,
             commands::top_days,

@@ -1,9 +1,10 @@
 //! The statistics database (SQLite).
 //!
-//! Traffic lives in 15-minute buckets per source and dimension, kept forever. A dimension is one
-//! way of splitting traffic (outbound node, subscription, process, inbound); the outbound rows of
-//! a bucket always add up to its total, with traffic that could not be attributed under the
-//! empty outbound key. Schema changes go through `migrate`, keyed by `PRAGMA user_version`.
+//! Traffic lives in 15-minute buckets per source, dimension and route, kept forever. A dimension
+//! is one way of splitting traffic (outbound node, subscription, process, inbound); the route says
+//! whether it went through a proxy (`proxy`, `direct`, empty when unknown). The outbound rows of a
+//! bucket always add up to its total, with traffic that could not be attributed under the empty
+//! outbound key and route. Schema changes go through `migrate`, keyed by `PRAGMA user_version`.
 
 use crate::domain::attribution::{AttributionRule, Field};
 use crate::domain::counter::{Bytes, Checkpoint, CoreId};
@@ -15,11 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 6;
-
-/// The rows that make up a total, with the route (`?3`) as a filter: all traffic is the outbound
-/// rows, which add up to the total; one route is its route rows.
-const SCOPE: &str = "((?3 IS NULL AND d.kind = 'outbound') OR (d.kind = 'route' AND d.key = ?3))";
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -128,6 +125,51 @@ JOIN dims r ON r.kind = 'route' AND r.key = CASE
 GROUP BY t.source_id, t.bucket, r.id;
 ";
 
+/// The route moves from a dimension of its own onto every row, so each dimension and each host
+/// can be read for one route. Rows written before carry what their own key tells: an outbound by
+/// mihomo's built-in names (as in v6), a subscription by whether it is the direct one. Processes,
+/// inbounds and hosts tell nothing about it, and are left without a route.
+const SCHEMA_V7: &str = "
+CREATE TABLE traffic_v7 (
+    source_id INTEGER NOT NULL,
+    bucket INTEGER NOT NULL,
+    dim_id INTEGER NOT NULL,
+    route TEXT NOT NULL,
+    up INTEGER NOT NULL,
+    down INTEGER NOT NULL,
+    PRIMARY KEY (source_id, bucket, dim_id, route)
+) WITHOUT ROWID;
+INSERT INTO traffic_v7 (source_id, bucket, dim_id, route, up, down)
+SELECT t.source_id, t.bucket, t.dim_id,
+    CASE
+        WHEN d.key = '' THEN ''
+        WHEN d.kind = 'outbound' AND (d.key = 'DIRECT' OR d.key = 'PASS' OR d.key LIKE 'REJECT%') THEN 'direct'
+        WHEN d.kind = 'outbound' THEN 'proxy'
+        WHEN d.kind = 'subscription' AND d.key = 'DIRECT' THEN 'direct'
+        WHEN d.kind = 'subscription' THEN 'proxy'
+        ELSE ''
+    END,
+    t.up, t.down
+FROM traffic t JOIN dims d ON d.id = t.dim_id
+WHERE d.kind <> 'route';
+DROP TABLE traffic;
+ALTER TABLE traffic_v7 RENAME TO traffic;
+DELETE FROM dims WHERE kind = 'route';
+CREATE TABLE domain_daily_v7 (
+    source_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    process_dim_id INTEGER NOT NULL,
+    domain_dim_id INTEGER NOT NULL,
+    route TEXT NOT NULL,
+    up INTEGER NOT NULL,
+    down INTEGER NOT NULL,
+    PRIMARY KEY (source_id, day, process_dim_id, domain_dim_id, route)
+) WITHOUT ROWID;
+INSERT INTO domain_daily_v7 SELECT source_id, day, process_dim_id, domain_dim_id, '', up, down FROM domain_daily;
+DROP TABLE domain_daily;
+ALTER TABLE domain_daily_v7 RENAME TO domain_daily;
+";
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostRuleRow {
@@ -189,6 +231,8 @@ pub struct BucketDelta {
     pub bucket: i64,
     pub kind: DimKind,
     pub key: String,
+    /// `proxy`, `direct`, or empty when unknown.
+    pub route: String,
     pub bytes: Bytes,
 }
 
@@ -200,6 +244,7 @@ pub struct HostDelta {
     pub day: String,
     pub process: String,
     pub host: String,
+    pub route: String,
     pub bytes: Bytes,
 }
 
@@ -314,24 +359,25 @@ impl Store {
         {
             let mut add = tx
                 .prepare_cached(
-                    "INSERT INTO traffic (source_id, bucket, dim_id, up, down) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT (source_id, bucket, dim_id) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+                    "INSERT INTO traffic (source_id, bucket, dim_id, route, up, down) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT (source_id, bucket, dim_id, route) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
                 )
                 .map_err(err)?;
             for d in deltas.iter().filter(|d| !d.bytes.is_zero()) {
                 let dim = dim_id(&tx, &mut dims, d.kind.as_str(), &d.key).map_err(err)?;
-                add.execute(params![d.source, d.bucket, dim, int(d.bytes.up), int(d.bytes.down)]).map_err(err)?;
+                add.execute(params![d.source, d.bucket, dim, d.route, int(d.bytes.up), int(d.bytes.down)]).map_err(err)?;
             }
             let mut host = tx
                 .prepare_cached(
-                    "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, up, down) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT (source_id, day, process_dim_id, domain_dim_id) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+                    "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, route, up, down) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT (source_id, day, process_dim_id, domain_dim_id, route)
+                     DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
                 )
                 .map_err(err)?;
             for h in hosts.iter().filter(|h| !h.bytes.is_zero()) {
                 let process = dim_id(&tx, &mut dims, DimKind::Process.as_str(), &h.process).map_err(err)?;
                 let name = dim_id(&tx, &mut dims, HOST, &h.host).map_err(err)?;
-                host.execute(params![h.source, h.day, process, name, int(h.bytes.up), int(h.bytes.down)]).map_err(err)?;
+                host.execute(params![h.source, h.day, process, name, h.route, int(h.bytes.up), int(h.bytes.down)]).map_err(err)?;
             }
             let mut mark = tx
                 .prepare_cached(
@@ -351,34 +397,54 @@ impl Store {
     }
 
     /// Traffic per key of one dimension in `range`, biggest first.
-    pub fn ranking(&self, kind: DimKind, range: Range, source: Option<i64>) -> Result<Vec<(String, Bytes)>, String> {
+    pub fn ranking(&self, kind: DimKind, range: Range, source: Option<i64>, route: Option<Route>) -> Result<Vec<(String, Bytes)>, String> {
         let mut stmt = self
             .conn
             .prepare_cached(
                 "SELECT d.key, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
                  WHERE d.kind = ?1 AND t.bucket >= ?2 AND t.bucket < ?3 AND (?4 IS NULL OR t.source_id = ?4)
+                   AND (?5 IS NULL OR t.route = ?5)
                  GROUP BY d.key ORDER BY SUM(t.up) + SUM(t.down) DESC",
             )
             .map_err(err)?;
-        let rows =
-            stmt.query_map(params![kind.as_str(), range.start, range.end, source], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
+        let rows = stmt
+            .query_map(params![kind.as_str(), range.start, range.end, source, route.map(Route::key)], |r| Ok((r.get(0)?, bytes_at(r, 1)?)))
+            .map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
 
-    /// Hosts and their processes over the local days `from` through `to`, biggest first.
-    pub fn hosts(&self, from: &str, to: &str, source: Option<i64>) -> Result<Vec<HostRow>, String> {
+    /// Traffic in `range` by route: `proxy`, `direct`, and the empty route for what has none.
+    pub fn routes(&self, range: Range, source: Option<i64>) -> Result<Vec<(String, Bytes)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT t.route, SUM(t.up), SUM(t.down)
+                 FROM traffic t JOIN dims d ON d.id = t.dim_id
+                 WHERE d.kind = 'outbound' AND t.bucket >= ?1 AND t.bucket < ?2 AND (?3 IS NULL OR t.source_id = ?3)
+                 GROUP BY t.route",
+            )
+            .map_err(err)?;
+        let rows = stmt.query_map(params![range.start, range.end, source], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
+        rows.collect::<Result<_, _>>().map_err(err)
+    }
+
+    /// Hosts and their processes over the local days `from` through `to`, of all traffic or of
+    /// one route's, biggest first.
+    pub fn hosts(&self, from: &str, to: &str, source: Option<i64>, route: Option<Route>) -> Result<Vec<HostRow>, String> {
         let mut stmt = self
             .conn
             .prepare_cached(
                 "SELECT p.key, h.key, SUM(x.up), SUM(x.down)
                  FROM domain_daily x JOIN dims p ON p.id = x.process_dim_id JOIN dims h ON h.id = x.domain_dim_id
-                 WHERE x.day >= ?1 AND x.day <= ?2 AND (?3 IS NULL OR x.source_id = ?3)
+                 WHERE x.day >= ?1 AND x.day <= ?2 AND (?3 IS NULL OR x.source_id = ?3) AND (?4 IS NULL OR x.route = ?4)
                  GROUP BY p.key, h.key ORDER BY SUM(x.up) + SUM(x.down) DESC",
             )
             .map_err(err)?;
         let rows = stmt
-            .query_map(params![from, to, source], |r| Ok(HostRow { process: r.get(0)?, host: r.get(1)?, bytes: bytes_at(r, 2)? }))
+            .query_map(params![from, to, source, route.map(Route::key)], |r| {
+                Ok(HostRow { process: r.get(0)?, host: r.get(1)?, bytes: bytes_at(r, 2)? })
+            })
             .map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
@@ -403,7 +469,7 @@ impl Store {
         tx.execute_batch("DROP TABLE IF EXISTS temp.dropped").map_err(err)?;
         tx.execute(
             "CREATE TEMP TABLE dropped AS
-                 SELECT source_id, day, process_dim_id, domain_dim_id, up, down FROM (
+                 SELECT source_id, day, process_dim_id, domain_dim_id, route, up, down FROM (
                      SELECT *,
                          ROW_NUMBER() OVER (PARTITION BY source_id, day ORDER BY up + down DESC) AS r_all,
                          ROW_NUMBER() OVER (PARTITION BY source_id, day, process_dim_id ORDER BY up + down DESC) AS r_proc
@@ -414,15 +480,15 @@ impl Store {
         .map_err(err)?;
         let merged: i64 = tx.query_row("SELECT COUNT(*) FROM temp.dropped", [], |r| r.get(0)).map_err(err)?;
         tx.execute(
-            "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, up, down)
-             SELECT source_id, day, process_dim_id, ?1, SUM(up), SUM(down) FROM temp.dropped GROUP BY source_id, day, process_dim_id
-             ON CONFLICT (source_id, day, process_dim_id, domain_dim_id) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+            "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, route, up, down)
+             SELECT source_id, day, process_dim_id, ?1, route, SUM(up), SUM(down) FROM temp.dropped GROUP BY source_id, day, process_dim_id, route
+             ON CONFLICT (source_id, day, process_dim_id, domain_dim_id, route) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
             [other],
         )
         .map_err(err)?;
         tx.execute(
-            "DELETE FROM domain_daily WHERE (source_id, day, process_dim_id, domain_dim_id) IN
-             (SELECT source_id, day, process_dim_id, domain_dim_id FROM temp.dropped)",
+            "DELETE FROM domain_daily WHERE (source_id, day, process_dim_id, domain_dim_id, route) IN
+             (SELECT source_id, day, process_dim_id, domain_dim_id, route FROM temp.dropped)",
             [],
         )
         .map_err(err)?;
@@ -461,12 +527,12 @@ impl Store {
     pub fn sums_by_source(&self, range: Range, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self
             .conn
-            .prepare_cached(&format!(
+            .prepare_cached(
                 "SELECT t.source_id, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
-                 WHERE {SCOPE} AND t.bucket >= ?1 AND t.bucket < ?2
-                 GROUP BY t.source_id"
-            ))
+                 WHERE d.kind = 'outbound' AND (?3 IS NULL OR t.route = ?3) AND t.bucket >= ?1 AND t.bucket < ?2
+                 GROUP BY t.source_id",
+            )
             .map_err(err)?;
         let rows =
             stmt.query_map(params![range.start, range.end, route.map(Route::key)], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
@@ -478,13 +544,13 @@ impl Store {
     pub fn buckets(&self, range: Range, source: Option<i64>, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self
             .conn
-            .prepare_cached(&format!(
+            .prepare_cached(
                 "SELECT t.bucket, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
-                 WHERE {SCOPE} AND t.bucket >= ?1 AND t.bucket < ?2
+                 WHERE d.kind = 'outbound' AND (?3 IS NULL OR t.route = ?3) AND t.bucket >= ?1 AND t.bucket < ?2
                    AND (?4 IS NULL OR t.source_id = ?4)
-                 GROUP BY t.bucket ORDER BY t.bucket"
-            ))
+                 GROUP BY t.bucket ORDER BY t.bucket",
+            )
             .map_err(err)?;
         let rows = stmt
             .query_map(params![range.start, range.end, route.map(Route::key), source], |r| Ok((r.get(0)?, bytes_at(r, 1)?)))
@@ -749,6 +815,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if version < 6 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;")).map_err(err)?;
     }
+    if version < 7 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V7} PRAGMA user_version = 7; COMMIT;")).map_err(err)?;
+    }
     Ok(())
 }
 
@@ -759,15 +828,22 @@ mod tests {
     const B: i64 = crate::domain::period::BUCKET_SECS;
 
     fn delta(source: i64, bucket: i64, up: u64, down: u64) -> BucketDelta {
-        BucketDelta { source, bucket, kind: DimKind::Outbound, key: String::new(), bytes: Bytes::new(up, down) }
+        BucketDelta { source, bucket, kind: DimKind::Outbound, key: String::new(), route: String::new(), bytes: Bytes::new(up, down) }
     }
 
     fn dim(source: i64, kind: DimKind, key: &str, down: u64) -> BucketDelta {
-        BucketDelta { source, bucket: 0, kind, key: key.into(), bytes: Bytes::new(0, down) }
+        BucketDelta { source, bucket: 0, kind, key: key.into(), route: String::new(), bytes: Bytes::new(0, down) }
     }
 
     fn host(day: &str, process: &str, host: &str, down: u64) -> HostDelta {
-        HostDelta { source: 1, day: day.into(), process: process.into(), host: host.into(), bytes: Bytes::new(0, down) }
+        HostDelta {
+            source: 1,
+            day: day.into(),
+            process: process.into(),
+            host: host.into(),
+            route: String::new(),
+            bytes: Bytes::new(0, down),
+        }
     }
 
     #[test]
@@ -787,25 +863,89 @@ mod tests {
     }
 
     #[test]
-    fn traffic_from_before_routes_is_given_one_by_its_outbound() {
-        // Arrange: outbound rows only, as written before the route dimension existed.
-        let mut store = Store::open_in_memory();
-        let s = store.ensure_source("a", "A", 0).unwrap();
-        let out =
-            |key: &str, down| BucketDelta { source: s, bucket: 0, kind: DimKind::Outbound, key: key.into(), bytes: Bytes::new(0, down) };
-        store.commit(&[out("HK 01", 600), out("DIRECT", 200), out("REJECT-DROP", 5), out("", 100), out("JP 02", 50)], &[], &[]).unwrap();
+    fn rows_from_before_routes_get_the_route_their_key_tells() {
+        // Arrange: a database as version 5 left it, one bucket and one day of traffic.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1}{SCHEMA_V2}{SCHEMA_V3}{SCHEMA_V4}{SCHEMA_V5} PRAGMA user_version = 5;")).unwrap();
+        conn.execute("INSERT INTO sources (id, key, name, created_at) VALUES (1, 'a', 'A', 0)", []).unwrap();
+        let rows = [
+            ("outbound", "HK 01", 600),
+            ("outbound", "DIRECT", 200),
+            ("outbound", "REJECT-DROP", 5),
+            ("outbound", "", 100),
+            ("subscription", "白月光", 600),
+            ("subscription", "DIRECT", 205),
+            ("process", "Chrome", 805),
+        ];
+        for (kind, key, down) in rows {
+            conn.execute("INSERT OR IGNORE INTO dims (kind, key) VALUES (?1, ?2)", params![kind, key]).unwrap();
+            conn.execute("INSERT INTO traffic SELECT 1, 0, id, 0, ?3 FROM dims WHERE kind = ?1 AND key = ?2", params![kind, key, down])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO dims (kind, key) VALUES ('domain', 'a.com');
+             INSERT INTO domain_daily SELECT 1, '2026-11-16', p.id, h.id, 0, 805 FROM dims p, dims h
+             WHERE p.kind = 'process' AND p.key = 'Chrome' AND h.kind = 'domain' AND h.key = 'a.com';",
+        )
+        .unwrap();
         let all = Range { start: 0, end: B };
 
         // Act
-        store.conn.execute_batch(SCHEMA_V6).unwrap();
-        let routes = store.ranking(DimKind::Route, all, None).unwrap();
-        let proxied = store.buckets(all, None, Some(Route::Proxy)).unwrap();
-        let total = store.buckets(all, None, None).unwrap();
+        let store = Store::init(conn).unwrap();
+        let by_route = |kind, route| store.ranking(kind, all, None, Some(route)).unwrap();
 
         // Assert
-        assert_eq!(routes.iter().map(|(k, b)| (k.as_str(), b.down)).collect::<Vec<_>>(), [("proxy", 650), ("direct", 205), ("", 100)]);
-        assert_eq!(proxied, vec![(0, Bytes::new(0, 650))]);
-        assert_eq!(total, vec![(0, Bytes::new(0, 955))]);
+        let mut routes = store.routes(all, None).unwrap();
+        routes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(routes, [("".into(), Bytes::new(0, 100)), ("direct".into(), Bytes::new(0, 205)), ("proxy".into(), Bytes::new(0, 600))]);
+        assert_eq!(by_route(DimKind::Subscription, Route::Direct), [("DIRECT".into(), Bytes::new(0, 205))]);
+        assert_eq!(by_route(DimKind::Subscription, Route::Proxy), [("白月光".into(), Bytes::new(0, 600))]);
+        assert!(by_route(DimKind::Process, Route::Proxy).is_empty());
+        assert_eq!(store.ranking(DimKind::Process, all, None, None).unwrap(), [("Chrome".into(), Bytes::new(0, 805))]);
+        assert!(store.hosts("2026-11-16", "2026-11-16", None, Some(Route::Proxy)).unwrap().is_empty());
+        assert_eq!(store.hosts("2026-11-16", "2026-11-16", None, None).unwrap().len(), 1);
+        assert_eq!(store.buckets(all, None, None).unwrap(), vec![(0, Bytes::new(0, 905))]);
+    }
+
+    #[test]
+    fn rows_are_kept_apart_by_route() {
+        // Arrange
+        let mut store = Store::open_in_memory();
+        let s = store.ensure_source("a", "A", 0).unwrap();
+        let row = |key: &str, route: &str, down| BucketDelta {
+            source: s,
+            bucket: 0,
+            kind: DimKind::Process,
+            key: key.into(),
+            route: route.into(),
+            bytes: Bytes::new(0, down),
+        };
+        let host = |route: &str, down| HostDelta {
+            source: s,
+            day: "2026-11-16".into(),
+            process: "curl".into(),
+            host: "a.com".into(),
+            route: route.into(),
+            bytes: Bytes::new(0, down),
+        };
+        store
+            .commit(
+                &[row("curl", "proxy", 30), row("curl", "direct", 10), row("Mail", "direct", 5)],
+                &[host("proxy", 30), host("direct", 10)],
+                &[],
+            )
+            .unwrap();
+        let all = Range { start: 0, end: B };
+
+        // Act
+        let direct = store.ranking(DimKind::Process, all, None, Some(Route::Direct)).unwrap();
+        let every = store.ranking(DimKind::Process, all, None, None).unwrap();
+        let proxied_hosts = store.hosts("2026-11-16", "2026-11-16", None, Some(Route::Proxy)).unwrap();
+
+        // Assert
+        assert_eq!(direct, [("curl".into(), Bytes::new(0, 10)), ("Mail".into(), Bytes::new(0, 5))]);
+        assert_eq!(every, [("curl".into(), Bytes::new(0, 40)), ("Mail".into(), Bytes::new(0, 5))]);
+        assert_eq!(proxied_hosts.iter().map(|h| h.bytes.down).collect::<Vec<_>>(), [30]);
     }
 
     #[test]
@@ -871,8 +1011,8 @@ mod tests {
         store.commit(&[dim(s, DimKind::Outbound, "HK", 6)], &[], &[]).unwrap();
 
         // Act
-        let outbound = store.ranking(DimKind::Outbound, Range { start: 0, end: B }, None).unwrap();
-        let process = store.ranking(DimKind::Process, Range { start: 0, end: B }, Some(s)).unwrap();
+        let outbound = store.ranking(DimKind::Outbound, Range { start: 0, end: B }, None, None).unwrap();
+        let process = store.ranking(DimKind::Process, Range { start: 0, end: B }, Some(s), None).unwrap();
 
         // Assert
         assert_eq!(outbound, vec![("HK".to_string(), Bytes::new(0, 11)), ("DIRECT".to_string(), Bytes::new(0, 9))]);
@@ -901,7 +1041,7 @@ mod tests {
 
         // Assert
         let day = |d: &str| {
-            let mut v: Vec<_> = store.hosts(d, d, None).unwrap().into_iter().map(|h| (h.process, h.host, h.bytes.down)).collect();
+            let mut v: Vec<_> = store.hosts(d, d, None, None).unwrap().into_iter().map(|h| (h.process, h.host, h.bytes.down)).collect();
             v.sort();
             v
         };

@@ -49,22 +49,30 @@ def main():
         return db.execute("SELECT id FROM dims WHERE kind = ? AND key = ?", (kind, key)).fetchone()[0]
 
     unattributed = dim("outbound", "")
-    # Traffic no connection accounts for has no route either.
-    no_route = dim("route", "")
-    # Each program as the app records it: a rule names what the core could not.
+    # Each program as the app records it: a rule names what the core could not. Programs that go
+    # out directly in fake-mihomo.py are direct, the rest go through a proxy.
     named = {inbound: name for name, inbound, _, on in RULES if on}
     programs = []
     for i, (name, w, hosts) in enumerate(fake.PROGRAMS):
         inbound = fake.DEDICATED_INBOUND.get(i)
-        programs.append((name or named.get(inbound, ""), w, hosts, inbound))
-    direct_share = sum(w for name, w, _ in fake.PROGRAMS if name in fake.DIRECT_HOSTS)
-    shared = sum(w for _, w, _, inbound in programs if inbound is None)
-    inbounds = [(name, shared * w) for name, w in fake.INBOUNDS] + [(inbound, w) for _, w, _, inbound in programs if inbound]
+        route = "direct" if name in fake.DIRECT_HOSTS else "proxy"
+        programs.append((name or named.get(inbound, ""), w, hosts, inbound, route))
+    direct_share = sum(w for name, w, _ in fake.PROGRAMS if name in fake.DIRECT_HOSTS) / sum(w for _, w, _ in fake.PROGRAMS)
+
+    # Each kind's shares as (key, route) -> weight.
+    def add(table, key, route, w):
+        table[(key, route)] = table.get((key, route), 0) + w
+
+    inbounds = {}
+    processes = {}
+    for name, w, _, inbound, route in programs:
+        add(processes, name, route, w)
+        for inb, iw in [(inbound, 1)] if inbound else fake.INBOUNDS:
+            add(inbounds, inb, route, w * iw)
     shares = {
-        "outbound": [(n, (1 - direct_share) * w) for n, _, w in fake.NODES] + [("DIRECT", direct_share)],
-        "route": [("proxy", 1 - direct_share), ("direct", direct_share)],
-        "subscription": [("白月光", (1 - direct_share) * 0.8), ("备用机场", (1 - direct_share) * 0.2), ("DIRECT", direct_share)],
-        "process": [(name, w) for name, w, _, _ in programs],
+        "outbound": {**{(n, "proxy"): (1 - direct_share) * w for n, _, w in fake.NODES}, ("DIRECT", "direct"): direct_share},
+        "subscription": {("白月光", "proxy"): (1 - direct_share) * 0.8, ("备用机场", "proxy"): (1 - direct_share) * 0.2, ("DIRECT", "direct"): direct_share},
+        "process": processes,
         "inbound": inbounds,
     }
     ids = {(k, key): dim(k, key) for k, opts in shares.items() for key, _ in opts}
@@ -94,32 +102,31 @@ def main():
             day_up += up
             day_down += down
             if back >= SPLIT_DAYS:
-                rows.append((source, bucket, unattributed, up, down))
-                rows.append((source, bucket, no_route, up, down))
+                rows.append((source, bucket, unattributed, "", up, down))
                 continue
             seen = 1 - fake.UNSEEN
-            rows.append((source, bucket, unattributed, int(up * fake.UNSEEN), int(down * fake.UNSEEN)))
-            rows.append((source, bucket, no_route, int(up * fake.UNSEEN), int(down * fake.UNSEEN)))
+            rows.append((source, bucket, unattributed, "", int(up * fake.UNSEEN), int(down * fake.UNSEEN)))
             for kind, opts in shares.items():
-                total = sum(w for _, w in opts)
-                for key, w in opts:
-                    f = w / total * seen * random.uniform(0.8, 1.2)
-                    rows.append((source, bucket, ids[(kind, key)], int(up * f), int(down * f)))
+                total = sum(opts.values())
+                # Every kind splits the same connections, so each adds up to what they carried.
+                for (key, route), w in opts.items():
+                    f = w / total * seen
+                    rows.append((source, bucket, ids[(kind, key)], route, int(up * f), int(down * f)))
         if back < SPLIT_DAYS:
             # Hosts cover what the listed connections carried: the day's traffic minus the unseen part.
             seen_up, seen_down = day_up * (1 - fake.UNSEEN), day_down * (1 - fake.UNSEEN)
             day = time.strftime("%Y-%m-%d", time.localtime(day_start))
-            for name, w, hosts, _ in programs:
+            for name, w, hosts, _, route in programs:
                 for i, host in enumerate(hosts):
                     f = w * (0.6 ** i) / sum(0.6 ** j for j in range(len(hosts))) * random.uniform(0.9, 1.1)
-                    host_rows.append((source, day, ids[("process", name)], dim("domain", host), int(seen_up * f), int(seen_down * f)))
+                    host_rows.append((source, day, ids[("process", name)], dim("domain", host), route, int(seen_up * f), int(seen_down * f)))
     db.executemany(
-        "INSERT INTO traffic (source_id, bucket, dim_id, up, down) VALUES (?, ?, ?, ?, ?)"
-        " ON CONFLICT (source_id, bucket, dim_id) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+        "INSERT INTO traffic (source_id, bucket, dim_id, route, up, down) VALUES (?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT (source_id, bucket, dim_id, route) DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
         rows,
     )
     db.executemany(
-        "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, up, down) VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, route, up, down) VALUES (?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
         host_rows,
     )

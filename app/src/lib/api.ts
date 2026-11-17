@@ -89,6 +89,8 @@ export interface RankRow extends Bytes {
    * it apart; their plain empty key is traffic of connections the core named no process for.
    */
   uncollected?: boolean;
+  /** In a ranking of one route: that route's traffic recorded, before routes were kept for this dimension, without one. */
+  unrouted?: boolean;
 }
 
 /** What an attribution rule looks at: so far the inbound's name, compared exactly. */
@@ -242,10 +244,11 @@ export const api = {
   history: (unit: PeriodUnit, from: string, to: string, source: number | null, route: Route | null) =>
     invoke<PeriodRow[]>("history", { unit, from, to, source, route }),
   /** Traffic of the local days `from` through `to` by route; the empty key is what has none. */
-  routes: (from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind: "route", from, to, source }),
-  ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
-  hosts: (from: string, to: string, source: number | null, process: string | null, group: string | null, view: HostView) =>
-    invoke<RankRow[]>("hosts", { from, to, source, process, group, view }),
+  routes: (from: string, to: string, source: number | null) => invoke<RankRow[]>("routes", { from, to, source }),
+  ranking: (kind: DimKind, from: string, to: string, source: number | null, route: Route | null) =>
+    invoke<RankRow[]>("ranking", { kind, from, to, source, route }),
+  hosts: (from: string, to: string, source: number | null, route: Route | null, process: string | null, group: string | null, view: HostView) =>
+    invoke<RankRow[]>("hosts", { from, to, source, route, process, group, view }),
   attributionRules: () => invoke<AttributionRule[]>("attribution_rules"),
   saveAttributionRule: (rule: AttributionRule) => invoke<number>("save_attribution_rule", { rule }),
   deleteAttributionRule: (id: number) => invoke<void>("delete_attribution_rule", { id }),

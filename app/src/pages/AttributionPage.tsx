@@ -20,7 +20,7 @@ function useSeenInbounds(open: boolean): string[] {
     if (!open) return;
     const today = new Date();
     const from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 29);
-    api.ranking("inbound", isoDate(from), isoDate(today), null).then(
+    api.ranking("inbound", isoDate(from), isoDate(today), null, null).then(
       (rows) => setNames(rows.map((r) => r.key).filter(Boolean)),
       () => setNames([]),
     );

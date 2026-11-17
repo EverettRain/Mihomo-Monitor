@@ -2,11 +2,13 @@ import { ChevronRight, FolderPlus, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AddToGroupDialog } from "@/components/AddToGroupDialog";
 import { Page, PageHeader } from "@/components/PageHeader";
+import { RouteShare } from "@/components/RouteShare";
 import { Segmented } from "@/components/Segmented";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
-import { api, errorText, type DimKind, type HostView, type RankRow, type Source } from "@/lib/api";
+import { api, errorText, type DimKind, type HostView, type RankRow, type Route, type Source } from "@/lib/api";
+import { ROUTE_FILTERS, routeOf, useRouteFilter } from "@/lib/route";
 import { bytes, cn, isoDate } from "@/lib/utils";
 
 type Tab = DimKind | "host";
@@ -57,6 +59,7 @@ function rangeDates(id: RangeId, weekStartsSunday: boolean): [string, string] {
 function keyLabel(tab: Tab, row: RankRow): { text: string; muted: boolean } {
   const key = row.key;
   if (row.uncollected) return { text: "未采到连接明细", muted: true };
+  if (row.unrouted) return { text: "未区分是否经代理", muted: true };
   if (!key) {
     const text = { outbound: "未归类", subscription: "未归类", process: "进程未识别", inbound: "未知入站", host: "其他" }[tab];
     return { text, muted: true };
@@ -165,6 +168,7 @@ function SubHosts({
   from,
   to,
   source,
+  route,
   process,
   group,
   view,
@@ -174,6 +178,7 @@ function SubHosts({
   from: string;
   to: string;
   source: number | null;
+  route: Route | null;
   process: string | null;
   group: string | null;
   view: HostView;
@@ -184,14 +189,14 @@ function SubHosts({
   const [rows, setRows] = useState<RankRow[] | null>(null);
   useEffect(() => {
     let active = true;
-    api.hosts(from, to, source, process, group, view).then(
+    api.hosts(from, to, source, route, process, group, view).then(
       (r) => active && setRows(r),
       () => active && setRows([]),
     );
     return () => {
       active = false;
     };
-  }, [process, group, from, to, source, view, version]);
+  }, [process, group, from, to, source, route, view, version]);
   if (!rows) return <div className="px-4 py-1.5 pl-9 text-[12px] text-muted">正在读取…</div>;
   if (!rows.length) return <div className="px-4 py-1.5 pl-9 text-[12px] text-muted">没有记录到域名</div>;
   const total = rows.reduce((t, r) => t + r.up + r.down, 0);
@@ -217,6 +222,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
   const [error, setError] = useState<string | null>(null);
   const [all, setAll] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
+  const [route, setRoute] = useRouteFilter();
   const [ruleNames, setRuleNames] = useState<Set<string>>(new Set());
 
   const recorded = (sources ?? []).filter((s): s is Source & { id: number } => s.id !== null);
@@ -228,7 +234,8 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
 
   const load = useCallback(async () => {
     try {
-      setRows(tab === "host" ? await api.hosts(from, to, source, null, null, view) : await api.ranking(tab, from, to, source));
+      const r = routeOf(route);
+      setRows(tab === "host" ? await api.hosts(from, to, source, r, null, null, view) : await api.ranking(tab, from, to, source, r));
       if (tab === "process") setRuleNames(new Set((await api.attributionRules()).map((r) => r.name)));
       setError(null);
     } catch (e) {
@@ -256,21 +263,24 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
         title="分布"
         subtitle="流量去了哪里：按节点、订阅、进程、入站和域名排行。"
         actions={
-          recorded.length > 1 && (
-            <Select
-              aria-label="查看的内核"
-              value={source ?? ""}
-              onChange={(e) => setSource(e.target.value ? Number(e.target.value) : null)}
-              className="h-7 w-auto min-w-[120px] max-w-[200px] truncate text-[12.5px]"
-            >
-              <option value="">全部内核</option>
-              {recorded.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </Select>
-          )
+          <>
+            <Segmented label="流量范围" value={route} onChange={setRoute} options={ROUTE_FILTERS} />
+            {recorded.length > 1 && (
+              <Select
+                aria-label="查看的内核"
+                value={source ?? ""}
+                onChange={(e) => setSource(e.target.value ? Number(e.target.value) : null)}
+                className="h-7 w-auto min-w-[120px] max-w-[200px] truncate text-[12.5px]"
+              >
+                <option value="">全部内核</option>
+                {recorded.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </>
         }
       />
       <div className="space-y-5 px-5">
@@ -292,6 +302,9 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
                 </span>
               )}
             </div>
+            <div className="mb-1.5 px-4">
+              <RouteShare from={from} to={to} source={source} filter={route} version={rows} />
+            </div>
             {onlyUnknown && (
               <p className="mx-4 mb-2 rounded-lg bg-warn-soft px-3 py-2 text-[12px] leading-[18px] text-warn">
                 内核没有提供进程信息。开启 TUN 模式，或在配置中设置 find-process-mode: always 后，这里会按程序区分。
@@ -307,8 +320,8 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
             ) : (
               <div>
                 {shown.map((r) => {
-                  const id = `${r.group ? "g:" : ""}${r.uncollected ? "u:" : ""}${r.key}`;
-                  const expands = (tab === "process" && !r.uncollected) || (tab === "host" && !!r.group);
+                  const id = `${r.group ? "g:" : ""}${r.uncollected ? "u:" : ""}${r.unrouted ? "r:" : ""}${r.key}`;
+                  const expands = (tab === "process" && !r.uncollected && !r.unrouted) || (tab === "host" && !!r.group);
                   return (
                     <div key={id}>
                       <Row
@@ -327,6 +340,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
                           from={from}
                           to={to}
                           source={source}
+                          route={routeOf(route)}
                           process={tab === "process" ? r.key : null}
                           group={tab === "host" ? r.key : null}
                           view={tab === "host" ? "host" : view}
@@ -346,7 +360,11 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
             )}
           </div>
         </section>
-        <p className="px-1 text-[11.5px] leading-relaxed text-muted">{HINTS[tab]}</p>
+        <p className="px-1 text-[11.5px] leading-relaxed text-muted">
+          {HINTS[tab]}
+          {route !== "all" &&
+            " 只看经代理或直连时，各维度只含能区分的流量；「未区分是否经代理」是开始按经代理 / 直连记录之前的明细，域名明细里不含这部分。"}
+        </p>
       </div>
       <AddToGroupDialog
         host={adding}

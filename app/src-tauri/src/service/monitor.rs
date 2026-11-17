@@ -10,7 +10,7 @@ use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{self, Reported};
 use crate::domain::hostgroup::{Matcher, Rule, RuleKind};
 use crate::domain::period::{self, bucket_of, Period, Range};
-use crate::domain::split::{self, DimKind, Dims, OutboundTypes, Route, Tracker};
+use crate::domain::split::{self, DimKey, DimKind, Dims, HostKey, OutboundTypes, Route, Tracker};
 use crate::infra::import::{self, Entry, Format, Parsed, Problem};
 use crate::infra::mihomo::Client;
 use crate::infra::store::{Added, BucketDelta, CycleRow, HostDelta, HostGroupRow, Store};
@@ -213,14 +213,15 @@ pub struct RankRow {
     /// for processes only, where the empty key itself is traffic of connections without one.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub uncollected: bool,
+    /// In a ranking of one route: traffic of that route recorded, before routes were kept for
+    /// this dimension, without one (key empty).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unrouted: bool,
 }
 
-/// Whether a pending row counts toward the total of `route`, or of all traffic.
-fn in_scope(kind: DimKind, key: &str, route: Option<Route>) -> bool {
-    match route {
-        None => kind == DimKind::Outbound,
-        Some(r) => kind == DimKind::Route && key == r.key(),
-    }
+/// Whether a row of route `row` is wanted when asking for `route`, or for all traffic.
+fn in_route(row: &str, route: Option<Route>) -> bool {
+    route.is_none_or(|r| r.key() == row)
 }
 
 fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
@@ -231,14 +232,19 @@ fn ranked_marked(map: HashMap<(String, bool), Bytes>) -> Vec<RankRow> {
     let mut rows: Vec<RankRow> = map
         .into_iter()
         .filter(|(_, b)| !b.is_zero())
-        .map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group, uncollected: false })
+        .map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group, uncollected: false, unrouted: false })
         .collect();
     sort_rows(&mut rows);
     rows
 }
 
 fn sort_rows(rows: &mut [RankRow]) {
-    rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)).then(a.uncollected.cmp(&b.uncollected)));
+    rows.sort_by(|a, b| {
+        (b.up + b.down)
+            .cmp(&(a.up + a.down))
+            .then_with(|| a.key.cmp(&b.key))
+            .then((a.uncollected, a.unrouted).cmp(&(b.uncollected, b.unrouted)))
+    });
 }
 
 /// How hosts are listed.
@@ -315,11 +321,11 @@ fn local_day(ts: i64) -> String {
 
 #[derive(Default)]
 struct State {
-    /// Traffic not yet in the database, per (source, bucket, dimension kind, key). The outbound
-    /// entries of a bucket add up to its total.
-    pending: BTreeMap<(i64, i64, DimKind, String), Bytes>,
-    /// Host traffic not yet in the database, per (source, local day, process, host).
-    pending_hosts: BTreeMap<(i64, String, String, String), Bytes>,
+    /// Traffic not yet in the database, per (source, bucket, dimension key and route). The
+    /// outbound entries of a bucket add up to its total.
+    pending: BTreeMap<(i64, i64, DimKey), Bytes>,
+    /// Host traffic not yet in the database, per (source, local day, process, host and route).
+    pending_hosts: BTreeMap<(i64, String, HostKey), Bytes>,
     /// Finished days before this one have had their hosts cut down to the top ones.
     hosts_pruned_before: String,
     /// Latest counters accounted for, per source; written with `pending`.
@@ -602,12 +608,12 @@ impl Monitor {
         if !delta.is_zero() || !conns.is_empty() {
             let s = split::split(delta, conns);
             let bucket = bucket_of(now);
-            for ((kind, k), b) in s.dims {
-                *st.pending.entry((id, bucket, kind, k)).or_default() += b;
+            for (k, b) in s.dims {
+                *st.pending.entry((id, bucket, k)).or_default() += b;
             }
             let day = local_day(now);
-            for ((process, host), b) in s.hosts {
-                *st.pending_hosts.entry((id, day.clone(), process, host)).or_default() += b;
+            for (k, b) in s.hosts {
+                *st.pending_hosts.entry((id, day.clone(), k)).or_default() += b;
             }
         }
         st.checkpoints.insert(id, Checkpoint { core: core.cloned(), totals, at: now });
@@ -662,21 +668,23 @@ impl Monitor {
         if !(pending.is_empty() && hosts.is_empty() && dirty.is_empty()) {
             let deltas: Vec<BucketDelta> = pending
                 .iter()
-                .map(|((source, bucket, kind, key), bytes)| BucketDelta {
+                .map(|((source, bucket, k), bytes)| BucketDelta {
                     source: *source,
                     bucket: *bucket,
-                    kind: *kind,
-                    key: key.clone(),
+                    kind: k.kind,
+                    key: k.key.clone(),
+                    route: k.route.clone(),
                     bytes: *bytes,
                 })
                 .collect();
             let host_deltas: Vec<HostDelta> = hosts
                 .iter()
-                .map(|((source, day, process, host), bytes)| HostDelta {
+                .map(|((source, day, k), bytes)| HostDelta {
                     source: *source,
                     day: day.clone(),
-                    process: process.clone(),
-                    host: host.clone(),
+                    process: k.process.clone(),
+                    host: k.host.clone(),
+                    route: k.route.clone(),
                     bytes: *bytes,
                 })
                 .collect();
@@ -721,7 +729,7 @@ impl Monitor {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
             .pending
             .iter()
-            .filter(|((_, b, kind, key), _)| in_scope(*kind, key, route) && range.contains(*b))
+            .filter(|((_, b, k), _)| k.kind == DimKind::Outbound && in_route(&k.route, route) && range.contains(*b))
             .map(|((s, ..), v)| (*s, *v))
             .collect();
         let mut out = lock(&self.store).sums_by_source(range, route)?;
@@ -740,7 +748,9 @@ impl Monitor {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
             .pending
             .iter()
-            .filter(|((s, b, kind, key), _)| in_scope(*kind, key, route) && source.is_none_or(|x| x == *s) && range.contains(*b))
+            .filter(|((s, b, k), _)| {
+                k.kind == DimKind::Outbound && in_route(&k.route, route) && source.is_none_or(|x| x == *s) && range.contains(*b)
+            })
             .map(|((_, b, ..), v)| (*b, *v))
             .collect();
         let mut rows = lock(&self.store).buckets(range, source, route)?;
@@ -888,40 +898,60 @@ impl Monitor {
     /// per-connection collection began); the rest is listed under the empty key. For processes
     /// the rest is a row of its own, marked `uncollected`, and the empty key is only the traffic
     /// of connections the core named no process for and no rule matched.
-    pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+    pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>, route: Option<Route>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
-        let mut map = self.kind_sums(kind, range, source)?;
-        // These two add up to the total by themselves, their remainder included.
-        if matches!(kind, DimKind::Outbound | DimKind::Route) {
+        let mut map = self.kind_sums(kind, range, source, route)?;
+        if kind == DimKind::Outbound {
             return Ok(ranked(map));
         }
-        let total = Prefix::new(self.buckets(range, source, None)?).sum(range);
+        let total = Prefix::new(self.buckets(range, source, route)?).sum(range);
         let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
         let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
-        if kind != DimKind::Process {
+        // Within one route, everything was carried by connections read (what none accounts for
+        // has no route), so what is missing is rows written without a route: before routes
+        // were kept for this dimension.
+        let (uncollected, unrouted) = (route.is_none() && kind == DimKind::Process, route.is_some());
+        if !(uncollected || unrouted) {
             *map.entry(String::new()).or_default() += rest;
             return Ok(ranked(map));
         }
         let mut rows = ranked(map);
         if !rest.is_zero() {
-            rows.push(RankRow { key: String::new(), up: rest.up, down: rest.down, group: false, uncollected: true });
+            rows.push(RankRow { key: String::new(), up: rest.up, down: rest.down, group: false, uncollected, unrouted });
             sort_rows(&mut rows);
         }
         Ok(rows)
     }
 
-    /// Traffic per key of one dimension in `range`, written and pending.
-    fn kind_sums(&self, kind: DimKind, range: Range, source: Option<i64>) -> Result<HashMap<String, Bytes>, String> {
+    /// Traffic per key of one dimension in `range`, of all traffic or one route's, written and
+    /// pending.
+    fn kind_sums(&self, kind: DimKind, range: Range, source: Option<i64>, route: Option<Route>) -> Result<HashMap<String, Bytes>, String> {
         let mut map: HashMap<String, Bytes> = HashMap::new();
-        for (key, b) in lock(&self.store).ranking(kind, range, source)? {
+        for (key, b) in lock(&self.store).ranking(kind, range, source, route)? {
             *map.entry(key).or_default() += b;
         }
-        for ((s, bucket, k, key), b) in lock(&self.state).pending.iter() {
-            if *k == kind && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
-                *map.entry(key.clone()).or_default() += *b;
+        for ((s, bucket, k), b) in lock(&self.state).pending.iter() {
+            if k.kind == kind && in_route(&k.route, route) && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
+                *map.entry(k.key.clone()).or_default() += *b;
             }
         }
         Ok(map)
+    }
+
+    /// Traffic over the local days `from` through `to` by route: `proxy`, `direct`, and the empty
+    /// key for what has none. Together they are all the traffic.
+    pub fn routes(&self, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+        let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
+        let mut map: HashMap<String, Bytes> = HashMap::new();
+        for (route, b) in lock(&self.store).routes(range, source)? {
+            *map.entry(route).or_default() += b;
+        }
+        for ((s, bucket, k), b) in lock(&self.state).pending.iter() {
+            if k.kind == DimKind::Outbound && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
+                *map.entry(k.route.clone()).or_default() += *b;
+            }
+        }
+        Ok(ranked(map))
     }
 
     /// Every subscription known — seen in traffic, reported by a client or core, or given a
@@ -932,11 +962,11 @@ impl Monitor {
         let zoned = jiff::Timestamp::from_second(now).map_err(|e| e.to_string())?.to_zoned_datetime(tz.clone());
         let month = period::current(Period::Month, &zoned, Weekday::Monday).map_err(|e| e.to_string())?;
         let seen = Range { start: now - SUBSCRIPTIONS_SEEN_DAYS * 86_400, end: now + 1 };
-        let month_use = self.kind_sums(DimKind::Subscription, month, None)?;
+        let month_use = self.kind_sums(DimKind::Subscription, month, None, None)?;
         let cycles = lock(&self.store).cycles()?;
         let reported = lock(&self.state).reported.clone();
 
-        let mut names: Vec<String> = self.kind_sums(DimKind::Subscription, seen, None)?.into_keys().collect();
+        let mut names: Vec<String> = self.kind_sums(DimKind::Subscription, seen, None, None)?.into_keys().collect();
         names.extend(reported.keys().cloned());
         names.extend(cycles.iter().map(|c| c.subscription.clone()));
         names.retain(|n| !n.is_empty() && n != split::DIRECT);
@@ -968,7 +998,7 @@ impl Monitor {
 
     fn cycle_view(&self, c: &CycleRow, now: i64, tz: &TimeZone) -> Result<CycleView, String> {
         let range = cycle::current_at(&c.reset, now, tz)?;
-        let bytes = self.kind_sums(DimKind::Subscription, range, None)?.get(&c.subscription).copied().unwrap_or_default();
+        let bytes = self.kind_sums(DimKind::Subscription, range, None, None)?.get(&c.subscription).copied().unwrap_or_default();
         let used = c.mode.used(bytes);
         Ok(CycleView { config: c.clone(), start: range.start, end: range.end, used, bytes, projected: cycle::projected(used, range, now) })
     }
@@ -1018,6 +1048,7 @@ impl Monitor {
         from: Date,
         to: Date,
         source: Option<i64>,
+        route: Option<Route>,
         process: Option<&str>,
         in_group: Option<&str>,
         view: HostView,
@@ -1025,10 +1056,10 @@ impl Monitor {
     ) -> Result<Vec<RankRow>, String> {
         let (from, to) = (from.to_string(), to.to_string());
         let mut rows: Vec<(String, String, Bytes)> =
-            lock(&self.store).hosts(&from, &to, source)?.into_iter().map(|h| (h.process, h.host, h.bytes)).collect();
-        for ((s, day, p, h), b) in lock(&self.state).pending_hosts.iter() {
-            if source.is_none_or(|x| x == *s) && *day >= from && *day <= to {
-                rows.push((p.clone(), h.clone(), *b));
+            lock(&self.store).hosts(&from, &to, source, route)?.into_iter().map(|h| (h.process, h.host, h.bytes)).collect();
+        for ((s, day, k), b) in lock(&self.state).pending_hosts.iter() {
+            if source.is_none_or(|x| x == *s) && in_route(&k.route, route) && *day >= from && *day <= to {
+                rows.push((k.process.clone(), k.host.clone(), *b));
             }
         }
         let matcher = if view == HostView::Group || in_group.is_some() { Some(self.matcher()?) } else { None };
@@ -1057,7 +1088,14 @@ impl Monitor {
                     r.up += folded.up;
                     r.down += folded.down;
                 }
-                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down, group: false, uncollected: false }),
+                None => all.push(RankRow {
+                    key: String::new(),
+                    up: folded.up,
+                    down: folded.down,
+                    group: false,
+                    uncollected: false,
+                    unrouted: false,
+                }),
             }
         }
         Ok(all)
@@ -1338,27 +1376,32 @@ mod tests {
         m.account("a", id, None, Some(Bytes::ZERO), Bytes::new(0, 1_000), &conns, at + 2);
         // Rankings and hosts are by the system's local days.
         let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
-        let rank = |kind| m.ranking(kind, today, today, Some(id)).unwrap().into_iter().map(|r| (r.key, r.down)).collect::<Vec<_>>();
+        let rank = |kind| m.ranking(kind, today, today, Some(id), None).unwrap().into_iter().map(|r| (r.key, r.down)).collect::<Vec<_>>();
 
         // Act
         let (outbound, subscription, process) = (rank(DimKind::Outbound), rank(DimKind::Subscription), rank(DimKind::Process));
-        let route = rank(DimKind::Route);
+        let route: Vec<(String, u64)> = m.routes(today, today, Some(id)).unwrap().into_iter().map(|r| (r.key, r.down)).collect();
+        let proxied_process: Vec<(String, u64)> =
+            m.ranking(DimKind::Process, today, today, Some(id), Some(Route::Proxy)).unwrap().into_iter().map(|r| (r.key, r.down)).collect();
+        let direct_hosts = m.hosts(today, today, Some(id), Some(Route::Direct), None, None, HostView::Host, 10).unwrap();
         let today_of = |r| m.overview_at(&noon(), Some(id), r, false).unwrap().today.down;
         let (all, proxied, direct) = (today_of(None), today_of(Some(Route::Proxy)), today_of(Some(Route::Direct)));
         m.flush().unwrap();
         let after = rank(DimKind::Outbound);
-        let chrome = m.hosts(today, today, Some(id), Some("Chrome"), None, HostView::Host, 10).unwrap();
-        let merged = m.hosts(today, today, Some(id), None, None, HostView::Domain, 1).unwrap();
+        let chrome = m.hosts(today, today, Some(id), None, Some("Chrome"), None, HostView::Host, 10).unwrap();
+        let merged = m.hosts(today, today, Some(id), None, None, None, HostView::Domain, 1).unwrap();
         let yt = m.create_group("YouTube", "").unwrap();
         m.add_rules(yt, "+.youtube.com\nytimg.com").unwrap();
-        let grouped = m.hosts(today, today, Some(id), None, None, HostView::Group, 10).unwrap();
-        let members = m.hosts(today, today, Some(id), None, Some("YouTube"), HostView::Host, 10).unwrap();
+        let grouped = m.hosts(today, today, Some(id), None, None, None, HostView::Group, 10).unwrap();
+        let members = m.hosts(today, today, Some(id), None, None, Some("YouTube"), HostView::Host, 10).unwrap();
 
         // Assert
         assert_eq!(outbound, vec![("HK 01".into(), 700), ("DIRECT".into(), 200), ("".into(), 100)]);
         assert_eq!(subscription, vec![("白月光".into(), 700), (split::DIRECT.into(), 200), ("".into(), 100)]);
         assert_eq!(process, vec![("Chrome".into(), 700), ("Mail".into(), 200), ("".into(), 100)]);
         assert_eq!(route, vec![("proxy".into(), 700), ("direct".into(), 200), ("".into(), 100)]);
+        assert_eq!(proxied_process, vec![("Chrome".into(), 700)]);
+        assert_eq!(direct_hosts.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("imap.qq.com", 200)]);
         assert_eq!((all, proxied, direct), (1_000, 700, 200));
         assert_eq!(after, outbound);
         assert_eq!(chrome.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("www.youtube.com", 600), ("i.ytimg.com", 100)]);
@@ -1368,6 +1411,45 @@ mod tests {
             [("YouTube", 700, true), ("qq.com", 200, false)]
         );
         assert_eq!(members.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["www.youtube.com", "i.ytimg.com"]);
+    }
+
+    #[test]
+    fn rows_without_a_route_are_listed_apart_when_one_route_is_shown() {
+        // Arrange: proxied traffic whose process rows were written before routes were kept,
+        // and newer proxied traffic of curl.
+        let (m, id) = monitor_with_source();
+        let at = noon().timestamp().as_second();
+        let row = |kind, key: &str, route: &str, down| BucketDelta {
+            source: id,
+            bucket: bucket_of(at),
+            kind,
+            key: key.into(),
+            route: route.into(),
+            bytes: Bytes::new(0, down),
+        };
+        lock(&m.store)
+            .commit(
+                &[
+                    row(DimKind::Outbound, "HK 01", "proxy", 500),
+                    row(DimKind::Process, "Chrome", "", 300),
+                    row(DimKind::Process, "curl", "proxy", 200),
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
+
+        // Act
+        let proxied = m.ranking(DimKind::Process, today, today, Some(id), Some(Route::Proxy)).unwrap();
+        let all = m.ranking(DimKind::Process, today, today, Some(id), None).unwrap();
+
+        // Assert
+        assert_eq!(
+            proxied.iter().map(|r| (r.key.as_str(), r.down, r.unrouted)).collect::<Vec<_>>(),
+            [("", 300, true), ("curl", 200, false)]
+        );
+        assert_eq!(all.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("Chrome", 300), ("curl", 200)]);
     }
 
     #[test]
@@ -1409,13 +1491,13 @@ mod tests {
         .unwrap();
         read(&m, 500, 1_000);
         let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
-        let rank = |kind| m.ranking(kind, today, today, Some(id)).unwrap();
+        let rank = |kind| m.ranking(kind, today, today, Some(id), None).unwrap();
 
         // Act
         let process = rank(DimKind::Process);
         let outbound = rank(DimKind::Outbound);
-        let named = m.hosts(today, today, Some(id), Some("Container: us-workstation"), None, HostView::Host, 10).unwrap();
-        let unnamed = m.hosts(today, today, Some(id), Some(""), None, HostView::Host, 10).unwrap();
+        let named = m.hosts(today, today, Some(id), None, Some("Container: us-workstation"), None, HostView::Host, 10).unwrap();
+        let unnamed = m.hosts(today, today, Some(id), None, Some(""), None, HostView::Host, 10).unwrap();
 
         // Assert
         assert_eq!(

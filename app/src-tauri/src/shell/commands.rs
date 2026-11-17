@@ -139,22 +139,36 @@ pub fn history(
 }
 
 #[tauri::command]
-pub fn ranking(monitor: Mon, kind: DimKind, from: String, to: String, source: Option<i64>) -> Result<Vec<RankRow>, String> {
-    monitor.ranking(kind, date(&from)?, date(&to)?, source)
+pub fn ranking(
+    monitor: Mon,
+    kind: DimKind,
+    from: String,
+    to: String,
+    source: Option<i64>,
+    route: Option<Route>,
+) -> Result<Vec<RankRow>, String> {
+    monitor.ranking(kind, date(&from)?, date(&to)?, source, route)
+}
+
+#[tauri::command]
+pub fn routes(monitor: Mon, from: String, to: String, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+    monitor.routes(date(&from)?, date(&to)?, source)
 }
 
 /// Hosts most traffic went to; `process` narrows them to one process, `group` to one host group.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn hosts(
     monitor: Mon,
     from: String,
     to: String,
     source: Option<i64>,
+    route: Option<Route>,
     process: Option<String>,
     group: Option<String>,
     view: HostView,
 ) -> Result<Vec<RankRow>, String> {
-    monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), group.as_deref(), view, 100)
+    monitor.hosts(date(&from)?, date(&to)?, source, route, process.as_deref(), group.as_deref(), view, 100)
 }
 
 #[tauri::command]
