@@ -235,7 +235,7 @@ app/scripts/readme-screenshots.sh
 
 ## 发布
 
-1. 在仓库的 **Settings → Secrets and variables → Actions** 中添加 `TAURI_SIGNING_PRIVATE_KEY`（updater 签名私钥的内容，无密码）。对应的公钥已写在 `app/src-tauri/tauri.conf.json`。
+1. 在仓库的 **Settings → Secrets and variables → Actions** 中添加 `TAURI_SIGNING_PRIVATE_KEY`（updater 签名私钥的内容，无密码；本地放在已被忽略的 `signing/updater.key`）。对应的公钥已写在 `app/src-tauri/tauri.conf.json`。
 2. 修改 `app/package.json`、`app/src-tauri/Cargo.toml` 与 `app/src-tauri/tauri.conf.json` 中的版本号并提交。
 3. 推送 `vX.Y.Z` 标签，`release.yml` 会构建 Windows 与 macOS（Apple Silicon、Intel）安装包，生成更新说明并发布；应用内的更新检查读取最新 Release 的 `latest.json`。更新说明默认按上一个标签以来的提交生成；存在 `docs/releases/vX.Y.Z.md` 时改用这份手写的说明。
 

@@ -6,6 +6,9 @@ app/src-tauri/gen/
 # Local reference material, not part of the project.
 references/
 
+# Updater signing keys. The private key goes to the TAURI_SIGNING_PRIVATE_KEY secret, never into git.
+signing/
+
 # macOS
 .DS_Store
 ._*
