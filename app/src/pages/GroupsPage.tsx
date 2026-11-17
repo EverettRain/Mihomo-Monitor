@@ -1,6 +1,7 @@
-import { ChevronLeft, Download, FolderPlus, Loader2, Pencil, Plus, Search, Tags, Trash2, Upload } from "lucide-react";
+import { ChevronLeft, FileCog, FolderPlus, Loader2, Pencil, Plus, Search, Tags, Trash2, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ImportDialog } from "@/components/ImportDialog";
+import { RulesFileDialog } from "@/components/RulesFileDialog";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
@@ -288,6 +289,7 @@ export function GroupsPage() {
   const [selected, setSelected] = useState<number | null>(null);
   const [editing, setEditing] = useState<{ open: boolean; group: HostGroup | null }>({ open: false, group: null });
   const [importing, setImporting] = useState<{ open: boolean; preset: number | null }>({ open: false, preset: null });
+  const [rulesFile, setRulesFile] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -303,14 +305,6 @@ export function GroupsPage() {
   useEffect(() => {
     void load();
   }, [load]);
-
-  const exportAll = async () => {
-    try {
-      if (await api.exportFile("mihomo-monitor-分组.json", await api.exportGroups(), false)) toast("已导出");
-    } catch (e) {
-      toast(errorText(e), "error");
-    }
-  };
 
   const current = groups?.find((g) => g.id === selected) ?? null;
   const back = useCallback(() => setSelected(null), []);
@@ -351,9 +345,9 @@ export function GroupsPage() {
               <Upload />
               导入
             </Button>
-            <Button size="sm" variant="outline" disabled={!groups?.length} onClick={() => void exportAll()}>
-              <Download />
-              导出
+            <Button size="sm" variant="outline" onClick={() => setRulesFile(true)}>
+              <FileCog />
+              配置文件
             </Button>
             <Button size="sm" onClick={() => setEditing({ open: true, group: null })}>
               <FolderPlus />
@@ -418,6 +412,7 @@ export function GroupsPage() {
         }}
       />
       <ImportDialog open={importing.open} groups={groups ?? []} preset={importing.preset} onClose={() => setImporting({ open: false, preset: null })} onDone={() => void load()} />
+      <RulesFileDialog open={rulesFile} onClose={() => setRulesFile(false)} onDone={() => void load()} />
     </Page>
   );
 }

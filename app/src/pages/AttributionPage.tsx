@@ -1,6 +1,7 @@
-import { Loader2, Plus, Signpost, Trash2 } from "lucide-react";
+import { FileCog, Loader2, Plus, Signpost, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
+import { RulesFileDialog } from "@/components/RulesFileDialog";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
@@ -152,6 +153,7 @@ export function AttributionPage() {
   const [rules, setRules] = useState<AttributionRule[] | null>(null);
   const [editing, setEditing] = useState<{ open: boolean; rule: AttributionRule | null }>({ open: false, rule: null });
   const [deleting, setDeleting] = useState<AttributionRule | null>(null);
+  const [rulesFile, setRulesFile] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -193,10 +195,16 @@ export function AttributionPage() {
         title="归属规则"
         subtitle="给内核没有识别出进程的流量起名字，例如容器或局域网设备经专用入站进来的流量。"
         actions={
-          <Button size="sm" onClick={create}>
-            <Plus />
-            新建规则
-          </Button>
+          <>
+            <Button size="sm" variant="outline" onClick={() => setRulesFile(true)}>
+              <FileCog />
+              配置文件
+            </Button>
+            <Button size="sm" onClick={create}>
+              <Plus />
+              新建规则
+            </Button>
+          </>
         }
       />
       <div className="px-5">
@@ -254,6 +262,7 @@ export function AttributionPage() {
         onClose={() => setEditing({ open: false, rule: null })}
         onSaved={() => void load()}
       />
+      <RulesFileDialog open={rulesFile} onClose={() => setRulesFile(false)} onDone={() => void load()} />
       <Dialog
         open={deleting !== null}
         onClose={() => setDeleting(null)}

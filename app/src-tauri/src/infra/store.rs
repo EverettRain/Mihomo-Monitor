@@ -12,6 +12,7 @@ use crate::domain::cycle::{CountMode, Reset};
 use crate::domain::hostgroup::{Rule, RuleKind};
 use crate::domain::period::Range;
 use crate::domain::split::{DimKind, Route};
+use crate::infra::rules_file::GroupSpec;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
@@ -802,6 +803,68 @@ impl Store {
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
         self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![key, value]).map(|_| ()).map_err(err)
+    }
+}
+
+impl Store {
+    /// Puts the groups and attribution rules of a rules file in place, in one transaction. A
+    /// part that is `None` stays as it is. With `keep_others`, groups and rules the file does not
+    /// name stay too: a group of the same name has its note and entries replaced, an attribution
+    /// rule for the same inbound is updated, the rest are added after the existing ones.
+    /// Otherwise the file replaces that part outright, its groups taking precedence in the
+    /// file's order.
+    pub fn apply_rules(
+        &mut self,
+        groups: Option<&[GroupSpec]>,
+        attribution: Option<&[AttributionRule]>,
+        keep_others: bool,
+        now: i64,
+    ) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(err)?;
+        if let Some(groups) = groups {
+            if !keep_others {
+                tx.execute_batch("DELETE FROM host_rules; DELETE FROM host_groups;").map_err(err)?;
+            }
+            for g in groups {
+                let existing: Option<i64> =
+                    tx.query_row("SELECT id FROM host_groups WHERE name = ?1", [&g.name], |r| r.get(0)).optional().map_err(err)?;
+                let id = match existing {
+                    Some(id) => {
+                        tx.execute("UPDATE host_groups SET note = ?2 WHERE id = ?1", params![id, g.note]).map_err(err)?;
+                        tx.execute("DELETE FROM host_rules WHERE group_id = ?1", [id]).map_err(err)?;
+                        id
+                    }
+                    None => tx
+                        .query_row(
+                            "INSERT INTO host_groups (name, note, created_at) VALUES (?1, ?2, ?3) RETURNING id",
+                            params![g.name, g.note, now],
+                            |r| r.get(0),
+                        )
+                        .map_err(err)?,
+                };
+                insert_rules(&tx, id, &g.rules)?;
+            }
+        }
+        if let Some(rules) = attribution {
+            if !keep_others {
+                tx.execute("DELETE FROM attribution_rules", []).map_err(err)?;
+            }
+            for r in rules {
+                let p = params![r.name, r.field.as_str(), r.value, r.priority, r.enabled];
+                // Replacing, the file may hold several rules for one inbound; each is its own.
+                let updated = if keep_others {
+                    tx.execute("UPDATE attribution_rules SET name = ?1, priority = ?4, enabled = ?5 WHERE field = ?2 AND value = ?3", p)
+                        .map_err(err)?
+                } else {
+                    0
+                };
+                if updated == 0 {
+                    tx.execute("INSERT INTO attribution_rules (name, field, value, priority, enabled) VALUES (?1, ?2, ?3, ?4, ?5)", p)
+                        .map_err(err)?;
+                }
+            }
+        }
+        tx.commit().map_err(err)
     }
 }
 

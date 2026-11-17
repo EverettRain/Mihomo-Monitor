@@ -5,6 +5,7 @@ pub mod import;
 pub mod mihomo;
 pub mod paths;
 pub mod releases;
+pub mod rules_file;
 pub mod settings;
 pub mod store;
 pub mod verge;

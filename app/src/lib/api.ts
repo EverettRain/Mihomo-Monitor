@@ -152,6 +152,21 @@ export interface ImportEntry {
   value: string;
 }
 
+/** What importing a rules file changes in one part of it, by name. */
+export interface PartPlan {
+  added: string[];
+  changed: string[];
+  removed: string[];
+  unchanged: number;
+}
+
+/** What importing a rules file changes; a part the file leaves out is null and stays as it is. */
+export interface RulesPlan {
+  groups: PartPlan | null;
+  attribution: PartPlan | null;
+  problems: ImportProblem[];
+}
+
 export interface ImportPreview {
   format: ImportFormat;
   entries: ImportEntry[];
@@ -269,14 +284,17 @@ export const api = {
   deleteRules: (ids: number[]) => invoke<void>("delete_rules", { ids }),
   importPreview: (text: string, format: ImportFormat) => invoke<ImportPreview>("import_preview", { text, format }),
   importApply: (entries: ImportEntry[], defaultGroup: string) => invoke<Added>("import_apply", { entries, defaultGroup }),
-  exportGroups: () => invoke<string>("export_groups"),
+  /** Host groups and attribution rules as one YAML rules file. */
+  exportRulesFile: () => invoke<string>("export_rules_file"),
+  planRulesFile: (text: string, keepOthers: boolean) => invoke<RulesPlan>("plan_rules_file", { text, keepOthers }),
+  applyRulesFile: (text: string, keepOthers: boolean) => invoke<RulesPlan>("apply_rules_file", { text, keepOthers }),
   subscriptions: () => invoke<Subscription[]>("subscriptions"),
   saveCycle: (cycle: CycleConfig) => invoke<number>("save_cycle", { cycle }),
   deleteCycle: (id: number) => invoke<void>("delete_cycle", { id }),
   dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
   topDays: (source: number | null, route: Route | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, route, limit }),
   /** Opens a save dialog and writes CSV or JSON; false when the user cancelled it. */
-  exportFile: (name: string, content: string, csv: boolean) => invoke<boolean>("export_file", { name, content, csv }),
+  exportFile: (name: string, content: string, kind: "csv" | "json" | "yaml") => invoke<boolean>("export_file", { name, content, kind }),
   releaseNotes: (after: string, upto: string) => invoke<ReleaseNote[]>("release_notes", { after, upto }),
   openReleasePage: (version: string) => invoke<void>("open_release_page", { version }),
   openDataDir: () => invoke<void>("open_data_dir"),

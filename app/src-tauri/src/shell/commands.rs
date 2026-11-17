@@ -12,7 +12,7 @@ use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
 use crate::infra::store::{Added, CycleRow, HostGroupRow};
 use crate::service::monitor::{
-    AddResult, Bounds, HostView, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView, SubscriptionView,
+    AddResult, Bounds, HostView, LivePoint, Monitor, Overview, PeriodRow, RankRow, RulesPlan, SourceView, SubscriptionView,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -247,9 +247,21 @@ pub fn import_apply(monitor: Mon, entries: Vec<Entry>, default_group: String) ->
     monitor.import_apply(entries, &default_group)
 }
 
+/// The host groups and attribution rules as one rules file.
 #[tauri::command]
-pub fn export_groups(monitor: Mon) -> Result<String, String> {
-    monitor.export_groups()
+pub fn export_rules_file(monitor: Mon) -> Result<String, String> {
+    monitor.export_rules_file()
+}
+
+/// What importing a rules file would change.
+#[tauri::command]
+pub fn plan_rules_file(monitor: Mon, text: String, keep_others: bool) -> Result<RulesPlan, String> {
+    monitor.plan_rules_file(&text, keep_others)
+}
+
+#[tauri::command]
+pub fn apply_rules_file(monitor: Mon, text: String, keep_others: bool) -> Result<RulesPlan, String> {
+    monitor.apply_rules_file(&text, keep_others)
 }
 
 #[tauri::command]
@@ -281,9 +293,14 @@ pub fn top_days(monitor: Mon, source: Option<i64>, route: Option<Route>, limit: 
 /// text; the path comes from the save dialog, so no page code can write elsewhere. `false` when
 /// cancelled.
 #[tauri::command]
-pub async fn export_file(app: AppHandle, name: String, content: String, csv: bool) -> Result<bool, String> {
+pub async fn export_file(app: AppHandle, name: String, content: String, kind: String) -> Result<bool, String> {
+    let csv = kind == "csv";
     tauri::async_runtime::spawn_blocking(move || {
-        let (label, ext) = if csv { ("CSV", "csv") } else { ("JSON", "json") };
+        let (label, ext) = match kind.as_str() {
+            "csv" => ("CSV", "csv"),
+            "yaml" => ("YAML", "yaml"),
+            _ => ("JSON", "json"),
+        };
         let Some(path) = app.dialog().file().set_file_name(&name).add_filter(label, &[ext]).blocking_save_file() else {
             return Ok(false);
         };

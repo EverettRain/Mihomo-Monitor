@@ -13,6 +13,7 @@ use crate::domain::period::{self, bucket_of, Period, Range};
 use crate::domain::split::{self, DimKey, DimKind, Dims, HostKey, OutboundTypes, Route, Tracker};
 use crate::infra::import::{self, Entry, Format, Parsed, Problem};
 use crate::infra::mihomo::Client;
+use crate::infra::rules_file::{self, GroupSpec, RulesFile};
 use crate::infra::store::{Added, BucketDelta, CycleRow, HostDelta, HostGroupRow, Store};
 use crate::infra::{discovery, paths, settings, verge};
 use jiff::civil::{Date, Weekday};
@@ -320,6 +321,26 @@ fn group_name(name: &str) -> Result<String, String> {
         n if n > 60 => Err("分组名称最多 60 个字。".into()),
         _ => Ok(name.to_string()),
     }
+}
+
+/// What importing a rules file changes in one part of it, by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartPlan {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: usize,
+}
+
+/// What importing a rules file changes; a part the file leaves out is `None` and stays as it is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RulesPlan {
+    pub groups: Option<PartPlan>,
+    pub attribution: Option<PartPlan>,
+    /// Groups, entries and rules that could not be read, and were left out.
+    pub problems: Vec<Problem>,
 }
 
 /// Local dates holding the first and the last recorded traffic.
@@ -1324,14 +1345,95 @@ impl Monitor {
         self.change_groups(|s| s.import_rules(&pairs, paths::now_secs()))
     }
 
-    /// Every group as JSON that `import` reads back.
-    pub fn export_groups(&self) -> Result<String, String> {
-        let groups: Vec<serde_json::Value> = lock(&self.store)
+    /// The host groups and attribution rules as a rules file.
+    pub fn export_rules_file(&self) -> Result<String, String> {
+        let store = lock(&self.store);
+        let groups: Vec<GroupSpec> = store
             .host_groups()?
             .into_iter()
-            .map(|g| serde_json::json!({"name": g.name, "note": g.note, "rules": g.rules.into_iter().map(|r| r.rule).collect::<Vec<_>>()}))
+            .map(|g| GroupSpec { name: g.name, note: g.note, rules: g.rules.into_iter().map(|r| r.rule).collect() })
             .collect();
-        serde_json::to_string_pretty(&serde_json::json!({ "groups": groups })).map_err(|e| e.to_string())
+        Ok(rules_file::render(&groups, &store.attribution_rules()?))
+    }
+
+    /// Reads a rules file, leaving out groups whose name would not be accepted when typed.
+    fn read_rules_file(text: &str) -> Result<(RulesFile, Vec<Problem>), String> {
+        let (mut file, mut problems) = rules_file::parse(text)?;
+        if let Some(groups) = file.groups.as_mut() {
+            groups.retain_mut(|g| match group_name(&g.name) {
+                Ok(name) => {
+                    g.name = name;
+                    true
+                }
+                Err(reason) => {
+                    problems.push(Problem { at: 0, text: format!("分组「{}」", g.name), reason });
+                    false
+                }
+            });
+        }
+        Ok((file, problems))
+    }
+
+    /// What importing a rules file would change. With `keep_others`, what the file does not
+    /// name stays; otherwise it goes.
+    pub fn plan_rules_file(&self, text: &str, keep_others: bool) -> Result<RulesPlan, String> {
+        let (file, problems) = Self::read_rules_file(text)?;
+        let store = lock(&self.store);
+        let groups = match &file.groups {
+            None => None,
+            Some(wanted) => {
+                let now = store.host_groups()?;
+                let mut plan = PartPlan::default();
+                for g in wanted {
+                    match now.iter().find(|n| n.name == g.name) {
+                        None => plan.added.push(g.name.clone()),
+                        Some(n) => {
+                            let had: HashSet<&Rule> = n.rules.iter().map(|r| &r.rule).collect();
+                            let has: HashSet<&Rule> = g.rules.iter().collect();
+                            if n.note != g.note || had != has {
+                                plan.changed.push(g.name.clone());
+                            } else {
+                                plan.unchanged += 1;
+                            }
+                        }
+                    }
+                }
+                if !keep_others {
+                    plan.removed = now.into_iter().filter(|n| !wanted.iter().any(|g| g.name == n.name)).map(|n| n.name).collect();
+                }
+                Some(plan)
+            }
+        };
+        let attribution = match &file.attribution {
+            None => None,
+            Some(wanted) => {
+                let now = store.attribution_rules()?;
+                let label = |r: &AttributionRule| format!("{}（{}）", r.name, r.value);
+                let same = |a: &AttributionRule, b: &AttributionRule| a.field == b.field && a.value == b.value;
+                let mut plan = PartPlan::default();
+                for r in wanted {
+                    match now.iter().find(|n| same(n, r)) {
+                        None => plan.added.push(label(r)),
+                        Some(n) if (&n.name, n.priority, n.enabled) != (&r.name, r.priority, r.enabled) => plan.changed.push(label(r)),
+                        Some(_) => plan.unchanged += 1,
+                    }
+                }
+                if !keep_others {
+                    plan.removed = now.iter().filter(|n| !wanted.iter().any(|r| same(n, r))).map(label).collect();
+                }
+                Some(plan)
+            }
+        };
+        Ok(RulesPlan { groups, attribution, problems })
+    }
+
+    /// Imports a rules file (see `plan_rules_file`); returns what it changed.
+    pub fn apply_rules_file(&self, text: &str, keep_others: bool) -> Result<RulesPlan, String> {
+        let plan = self.plan_rules_file(text, keep_others)?;
+        let (file, _) = Self::read_rules_file(text)?;
+        self.change_groups(|s| s.apply_rules(file.groups.as_deref(), file.attribution.as_deref(), keep_others, paths::now_secs()))?;
+        *lock(&self.attributor) = None;
+        Ok(plan)
     }
 
     /// Today's traffic of every source, for the tray.
@@ -1671,6 +1773,61 @@ mod tests {
         assert_eq!(sum(&outbound), 1_000);
         assert_eq!(named.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("api.example.com", 300)]);
         assert_eq!(unnamed.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("api.example.com", 300)]);
+    }
+
+    #[test]
+    fn a_rules_file_replaces_or_merges_groups_and_rules() {
+        // Arrange: groups A and B and one rule; the file edits A, adds C, renames the rule and
+        // adds another; B is not in it.
+        let fresh = || {
+            let (m, _) = monitor_with_source();
+            let a = m.create_group("A", "").unwrap();
+            m.add_rules(a, "a.com").unwrap();
+            let b = m.create_group("B", "旧备注").unwrap();
+            m.add_rules(b, "b.com").unwrap();
+            let rule = |name: &str, inbound: &str| AttributionRule {
+                id: None,
+                name: name.into(),
+                field: crate::domain::attribution::Field::Inbound,
+                value: inbound.into(),
+                priority: 10,
+                enabled: true,
+            };
+            m.save_attribution_rule(rule("容器", "Port-1")).unwrap();
+            m
+        };
+        let file = "groups:\n  - name: C\n    entries: [c.com]\n  - name: A\n    entries: [a.com, 'DOMAIN,www.a.com']\nattribution:\n  - name: 容器 1\n    inbound: Port-1\n    priority: 10\n  - name: NAS\n    inbound: Port-2\n";
+        let names = |m: &Monitor| m.host_groups().unwrap().into_iter().map(|g| (g.name, g.rules.len())).collect::<Vec<_>>();
+
+        // Act
+        let replace = fresh();
+        let plan = replace.plan_rules_file(file, false).unwrap();
+        replace.apply_rules_file(file, false).unwrap();
+        let merge = fresh();
+        let merged = merge.apply_rules_file(file, true).unwrap();
+        let exported = replace.export_rules_file().unwrap();
+
+        // Assert
+        let groups = plan.groups.unwrap();
+        assert_eq!((groups.added, groups.changed, groups.removed), (vec!["C".to_string()], vec!["A".to_string()], vec!["B".to_string()]));
+        let rules = plan.attribution.unwrap();
+        assert_eq!((rules.added, rules.changed), (vec!["NAS（Port-2）".to_string()], vec!["容器 1（Port-1）".to_string()]));
+        assert_eq!(names(&replace), [("C".to_string(), 1), ("A".to_string(), 2)]);
+        assert_eq!(names(&merge), [("A".to_string(), 2), ("B".to_string(), 1), ("C".to_string(), 1)]);
+        assert!(merged.groups.unwrap().removed.is_empty());
+        assert_eq!(merge.attribution_rules().unwrap().iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["容器 1", "NAS"]);
+        assert_eq!(replace.plan_rules_file(&exported, false).unwrap().groups.unwrap().unchanged, 2);
+        assert!(
+            replace.attributor().unwrap().process_of(&crate::domain::split::Conn {
+                id: "1".into(),
+                bytes: Bytes::ZERO,
+                chains: vec![],
+                provider_chains: vec![],
+                process: String::new(),
+                inbound: "Port-2".into(),
+                host: String::new(),
+            }) == "NAS"
+        );
     }
 
     #[test]

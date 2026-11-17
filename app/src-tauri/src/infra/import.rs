@@ -302,6 +302,15 @@ fn yaml_entries(text: &str, out: &mut Parsed) {
             }
         }
     };
+    let key = |k: &str| matches!(doc, Yaml::Hash(h) if h.contains_key(&Yaml::String(k.into())));
+    if key("attribution") || (key("groups") && key("version")) {
+        out.problems.push(Problem {
+            at: 0,
+            text: String::new(),
+            reason: "这是规则配置文件（分组与归属规则），请用「配置文件」导入".into(),
+        });
+        return;
+    }
     match doc {
         Yaml::Hash(h) if h.contains_key(&Yaml::String("payload".into())) => list(&doc["payload"], None, out),
         Yaml::Hash(h) => {

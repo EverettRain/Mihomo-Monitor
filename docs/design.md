@@ -183,6 +183,7 @@ cycles      (id, subscription, anchor, quota_bytes, count_mode, alerts)
 - 导入解析在 `infra/import.rs`：文本、CSV / TSV（`csv` crate）、JSON（含 sing-box rule-set 与本应用导出格式）、YAML（Clash rule-provider）；自动识别格式；逐行报告无法识别的原因，不让整个导入失败。导入先预览、确认后在一个事务里写入。
 - 存储：v4 迁移新增 `host_groups`、`host_rules`（同一分组内条目唯一）。分组变化后，内存里编译好的匹配器失效重建。
 - 分布页“按分组”时，未命中任何分组的域名按主域名显示。
+- 规则配置文件（`infra/rules_file.rs`）：分组与归属规则一个 YAML（也读 JSON），条目用 Clash 规则行；缺省的段不属于文件，导入时那部分不动。导入先由 `plan_rules_file` 与当前内容比对（分组按名、归属规则按入站），列出新增 / 修改 / 删除与无法识别的项；`apply_rules_file` 在一个事务里落地：以文件为准时整体替换（分组按文件顺序重建，决定优先级），只新增和更新时同名覆盖、其余追加。条目导入遇到规则配置文件会提示改用配置文件导入。
 
 ## 7.3 经代理 / 直连（新增需求）
 
