@@ -1,6 +1,6 @@
 {
   "name": "mihomo-monitor",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Mihomo-Monitor - vnstat-style traffic statistics for the mihomo core you already run",
   "type": "module",
