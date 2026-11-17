@@ -91,6 +91,9 @@ export interface RankRow extends Bytes {
   uncollected?: boolean;
   /** In a ranking of one route: that route's traffic recorded, before routes were kept for this dimension, without one. */
   unrouted?: boolean;
+  /** Of up + down, what went through a proxy and what went directly; the rest has no known route. */
+  proxy: number;
+  direct: number;
 }
 
 /** What an attribution rule looks at: so far the inbound's name, compared exactly. */

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type RankRow, type Route } from "@/lib/api";
-import { ROUTE_LABEL, type RouteFilter } from "@/lib/route";
+import { ROUTE_FILL, ROUTE_LABEL, type RouteFilter } from "@/lib/route";
 import { bytes, cn } from "@/lib/utils";
 
 const ORDER: (Route | "")[] = ["proxy", "direct", ""];
@@ -9,7 +9,22 @@ const ORDER: (Route | "")[] = ["proxy", "direct", ""];
  * How the traffic of the local days `from` through `to` divides by route, with the filtered one
  * stressed. Shown beside any figure narrowed to one route, so what it leaves out stays in sight.
  */
-export function RouteShare({ from, to, source, filter, version }: { from: string; to: string; source: number | null; filter: RouteFilter; version?: unknown }) {
+export function RouteShare({
+  from,
+  to,
+  source,
+  filter,
+  version,
+  swatches,
+}: {
+  from: string;
+  to: string;
+  source: number | null;
+  filter: RouteFilter;
+  version?: unknown;
+  /** Marks each route with its bar color, as the legend of bars split by route. */
+  swatches?: boolean;
+}) {
   const [rows, setRows] = useState<RankRow[] | null>(null);
   useEffect(() => {
     let active = true;
@@ -36,6 +51,7 @@ export function RouteShare({ from, to, source, filter, version }: { from: string
         return (
           <span key={key} className={cn(filter !== "all" && filter === key && "font-medium text-fg")}>
             {i > 0 && <span className="mr-2 text-faint">·</span>}
+            {swatches && <span aria-hidden className={cn("mr-1.5 inline-block h-2 w-2 rounded-[2px] align-[1px]", ROUTE_FILL[key])} />}
             {ROUTE_LABEL[key]} <span className="font-mono tabular-nums">{bytes(v)}</span>
             <span className="ml-1 tabular-nums">{Math.round((v / total) * 100)}%</span>
           </span>

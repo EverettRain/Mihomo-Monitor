@@ -217,6 +217,42 @@ pub struct RankRow {
     /// this dimension, without one (key empty).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unrouted: bool,
+    /// Of `up + down`, what went through a proxy and what went directly; the rest has no known
+    /// route.
+    pub proxy: u64,
+    pub direct: u64,
+}
+
+/// A key's traffic, and how much of it went through a proxy or directly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+    bytes: Bytes,
+    proxy: u64,
+    direct: u64,
+}
+
+impl Tally {
+    fn add(&mut self, route: &str, b: Bytes) {
+        self.bytes += b;
+        match route {
+            "proxy" => self.proxy += b.up + b.down,
+            "direct" => self.direct += b.up + b.down,
+            _ => {}
+        }
+    }
+
+    fn row(self, key: String) -> RankRow {
+        RankRow {
+            key,
+            up: self.bytes.up,
+            down: self.bytes.down,
+            group: false,
+            uncollected: false,
+            unrouted: false,
+            proxy: self.proxy,
+            direct: self.direct,
+        }
+    }
 }
 
 /// Whether a row of route `row` is wanted when asking for `route`, or for all traffic.
@@ -224,16 +260,13 @@ fn in_route(row: &str, route: Option<Route>) -> bool {
     route.is_none_or(|r| r.key() == row)
 }
 
-fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
-    ranked_marked(map.into_iter().map(|(k, b)| ((k, false), b)).collect())
+fn ranked(map: HashMap<String, Tally>) -> Vec<RankRow> {
+    ranked_marked(map.into_iter().map(|(k, t)| ((k, false), t)).collect())
 }
 
-fn ranked_marked(map: HashMap<(String, bool), Bytes>) -> Vec<RankRow> {
-    let mut rows: Vec<RankRow> = map
-        .into_iter()
-        .filter(|(_, b)| !b.is_zero())
-        .map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group, uncollected: false, unrouted: false })
-        .collect();
+fn ranked_marked(map: HashMap<(String, bool), Tally>) -> Vec<RankRow> {
+    let mut rows: Vec<RankRow> =
+        map.into_iter().filter(|(_, t)| !t.bytes.is_zero()).map(|((key, group), t)| RankRow { group, ..t.row(key) }).collect();
     sort_rows(&mut rows);
     rows
 }
@@ -905,19 +938,22 @@ impl Monitor {
             return Ok(ranked(map));
         }
         let total = Prefix::new(self.buckets(range, source, route)?).sum(range);
-        let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
+        let known = map.values().fold(Bytes::ZERO, |a, t| a + t.bytes);
         let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
         // Within one route, everything was carried by connections read (what none accounts for
         // has no route), so what is missing is rows written without a route: before routes
         // were kept for this dimension.
         let (uncollected, unrouted) = (route.is_none() && kind == DimKind::Process, route.is_some());
         if !(uncollected || unrouted) {
-            *map.entry(String::new()).or_default() += rest;
+            map.entry(String::new()).or_default().add("", rest);
             return Ok(ranked(map));
         }
         let mut rows = ranked(map);
         if !rest.is_zero() {
-            rows.push(RankRow { key: String::new(), up: rest.up, down: rest.down, group: false, uncollected, unrouted });
+            // Within one route the rest is that route's traffic, only not split by this dimension.
+            let mut t = Tally::default();
+            t.add(route.map_or("", Route::key), rest);
+            rows.push(RankRow { uncollected, unrouted, ..t.row(String::new()) });
             sort_rows(&mut rows);
         }
         Ok(rows)
@@ -925,14 +961,14 @@ impl Monitor {
 
     /// Traffic per key of one dimension in `range`, of all traffic or one route's, written and
     /// pending.
-    fn kind_sums(&self, kind: DimKind, range: Range, source: Option<i64>, route: Option<Route>) -> Result<HashMap<String, Bytes>, String> {
-        let mut map: HashMap<String, Bytes> = HashMap::new();
-        for (key, b) in lock(&self.store).ranking(kind, range, source, route)? {
-            *map.entry(key).or_default() += b;
+    fn kind_sums(&self, kind: DimKind, range: Range, source: Option<i64>, route: Option<Route>) -> Result<HashMap<String, Tally>, String> {
+        let mut map: HashMap<String, Tally> = HashMap::new();
+        for (key, r, b) in lock(&self.store).ranking(kind, range, source, route)? {
+            map.entry(key).or_default().add(&r, b);
         }
         for ((s, bucket, k), b) in lock(&self.state).pending.iter() {
             if k.kind == kind && in_route(&k.route, route) && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
-                *map.entry(k.key.clone()).or_default() += *b;
+                map.entry(k.key.clone()).or_default().add(&k.route, *b);
             }
         }
         Ok(map)
@@ -942,13 +978,13 @@ impl Monitor {
     /// key for what has none. Together they are all the traffic.
     pub fn routes(&self, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
-        let mut map: HashMap<String, Bytes> = HashMap::new();
+        let mut map: HashMap<String, Tally> = HashMap::new();
         for (route, b) in lock(&self.store).routes(range, source)? {
-            *map.entry(route).or_default() += b;
+            map.entry(route.clone()).or_default().add(&route, b);
         }
         for ((s, bucket, k), b) in lock(&self.state).pending.iter() {
             if k.kind == DimKind::Outbound && range.contains(*bucket) && source.is_none_or(|x| x == *s) {
-                *map.entry(k.route.clone()).or_default() += *b;
+                map.entry(k.route.clone()).or_default().add(&k.route, *b);
             }
         }
         Ok(ranked(map))
@@ -962,7 +998,8 @@ impl Monitor {
         let zoned = jiff::Timestamp::from_second(now).map_err(|e| e.to_string())?.to_zoned_datetime(tz.clone());
         let month = period::current(Period::Month, &zoned, Weekday::Monday).map_err(|e| e.to_string())?;
         let seen = Range { start: now - SUBSCRIPTIONS_SEEN_DAYS * 86_400, end: now + 1 };
-        let month_use = self.kind_sums(DimKind::Subscription, month, None, None)?;
+        let month_use: HashMap<String, Bytes> =
+            self.kind_sums(DimKind::Subscription, month, None, None)?.into_iter().map(|(k, t)| (k, t.bytes)).collect();
         let cycles = lock(&self.store).cycles()?;
         let reported = lock(&self.state).reported.clone();
 
@@ -998,7 +1035,7 @@ impl Monitor {
 
     fn cycle_view(&self, c: &CycleRow, now: i64, tz: &TimeZone) -> Result<CycleView, String> {
         let range = cycle::current_at(&c.reset, now, tz)?;
-        let bytes = self.kind_sums(DimKind::Subscription, range, None, None)?.get(&c.subscription).copied().unwrap_or_default();
+        let bytes = self.kind_sums(DimKind::Subscription, range, None, None)?.get(&c.subscription).map(|t| t.bytes).unwrap_or_default();
         let used = c.mode.used(bytes);
         Ok(CycleView { config: c.clone(), start: range.start, end: range.end, used, bytes, projected: cycle::projected(used, range, now) })
     }
@@ -1055,16 +1092,16 @@ impl Monitor {
         limit: usize,
     ) -> Result<Vec<RankRow>, String> {
         let (from, to) = (from.to_string(), to.to_string());
-        let mut rows: Vec<(String, String, Bytes)> =
-            lock(&self.store).hosts(&from, &to, source, route)?.into_iter().map(|h| (h.process, h.host, h.bytes)).collect();
+        let mut rows: Vec<(String, String, String, Bytes)> =
+            lock(&self.store).hosts(&from, &to, source, route)?.into_iter().map(|h| (h.process, h.host, h.route, h.bytes)).collect();
         for ((s, day, k), b) in lock(&self.state).pending_hosts.iter() {
             if source.is_none_or(|x| x == *s) && in_route(&k.route, route) && *day >= from && *day <= to {
-                rows.push((k.process.clone(), k.host.clone(), *b));
+                rows.push((k.process.clone(), k.host.clone(), k.route.clone(), *b));
             }
         }
         let matcher = if view == HostView::Group || in_group.is_some() { Some(self.matcher()?) } else { None };
-        let mut map: HashMap<(String, bool), Bytes> = HashMap::new();
-        for (p, h, b) in rows {
+        let mut map: HashMap<(String, bool), Tally> = HashMap::new();
+        for (p, h, r, b) in rows {
             if process.is_some_and(|want| want != p) {
                 continue;
             }
@@ -1077,25 +1114,24 @@ impl Monitor {
                 (HostView::Host, _) => (h, false),
                 _ => (split::registrable(&h).to_string(), false),
             };
-            *map.entry(key).or_default() += b;
+            map.entry(key).or_default().add(&r, b);
         }
         let mut all = ranked_marked(map);
         if all.len() > limit {
             let rest = all.split_off(limit);
-            let folded = rest.iter().fold(Bytes::ZERO, |a, r| a + Bytes::new(r.up, r.down));
+            let folded = rest.iter().fold(Tally::default(), |a, r| Tally {
+                bytes: a.bytes + Bytes::new(r.up, r.down),
+                proxy: a.proxy + r.proxy,
+                direct: a.direct + r.direct,
+            });
             match all.iter_mut().find(|r| r.key.is_empty() && !r.group) {
                 Some(r) => {
-                    r.up += folded.up;
-                    r.down += folded.down;
+                    r.up += folded.bytes.up;
+                    r.down += folded.bytes.down;
+                    r.proxy += folded.proxy;
+                    r.direct += folded.direct;
                 }
-                None => all.push(RankRow {
-                    key: String::new(),
-                    up: folded.up,
-                    down: folded.down,
-                    group: false,
-                    uncollected: false,
-                    unrouted: false,
-                }),
+                None => all.push(folded.row(String::new())),
             }
         }
         Ok(all)
@@ -1401,6 +1437,12 @@ mod tests {
         assert_eq!(process, vec![("Chrome".into(), 700), ("Mail".into(), 200), ("".into(), 100)]);
         assert_eq!(route, vec![("proxy".into(), 700), ("direct".into(), 200), ("".into(), 100)]);
         assert_eq!(proxied_process, vec![("Chrome".into(), 700)]);
+        let split_of = |kind| -> Vec<(String, u64, u64)> {
+            m.ranking(kind, today, today, Some(id), None).unwrap().into_iter().map(|r| (r.key, r.proxy, r.direct)).collect()
+        };
+        assert_eq!(split_of(DimKind::Subscription), vec![("白月光".into(), 700, 0), (split::DIRECT.into(), 0, 200), ("".into(), 0, 0)]);
+        assert_eq!(split_of(DimKind::Process), vec![("Chrome".into(), 700, 0), ("Mail".into(), 0, 200), ("".into(), 0, 0)]);
+        assert!(chrome.iter().all(|r| r.proxy == r.up + r.down && r.direct == 0));
         assert_eq!(direct_hosts.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("imap.qq.com", 200)]);
         assert_eq!((all, proxied, direct), (1_000, 700, 200));
         assert_eq!(after, outbound);

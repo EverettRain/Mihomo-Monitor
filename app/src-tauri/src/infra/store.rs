@@ -248,11 +248,12 @@ pub struct HostDelta {
     pub bytes: Bytes,
 }
 
-/// A host's traffic, with the process that made it.
+/// A host's traffic, with the process that made it and the route it took.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostRow {
     pub process: String,
     pub host: String,
+    pub route: String,
     pub bytes: Bytes,
 }
 
@@ -397,19 +398,28 @@ impl Store {
     }
 
     /// Traffic per key of one dimension in `range`, biggest first.
-    pub fn ranking(&self, kind: DimKind, range: Range, source: Option<i64>, route: Option<Route>) -> Result<Vec<(String, Bytes)>, String> {
+    /// Traffic per key and route of one dimension in `range`, of all traffic or one route's.
+    pub fn ranking(
+        &self,
+        kind: DimKind,
+        range: Range,
+        source: Option<i64>,
+        route: Option<Route>,
+    ) -> Result<Vec<(String, String, Bytes)>, String> {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT d.key, SUM(t.up), SUM(t.down)
+                "SELECT d.key, t.route, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
                  WHERE d.kind = ?1 AND t.bucket >= ?2 AND t.bucket < ?3 AND (?4 IS NULL OR t.source_id = ?4)
                    AND (?5 IS NULL OR t.route = ?5)
-                 GROUP BY d.key ORDER BY SUM(t.up) + SUM(t.down) DESC",
+                 GROUP BY d.key, t.route",
             )
             .map_err(err)?;
         let rows = stmt
-            .query_map(params![kind.as_str(), range.start, range.end, source, route.map(Route::key)], |r| Ok((r.get(0)?, bytes_at(r, 1)?)))
+            .query_map(params![kind.as_str(), range.start, range.end, source, route.map(Route::key)], |r| {
+                Ok((r.get(0)?, r.get(1)?, bytes_at(r, 2)?))
+            })
             .map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
@@ -435,15 +445,15 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT p.key, h.key, SUM(x.up), SUM(x.down)
+                "SELECT p.key, h.key, x.route, SUM(x.up), SUM(x.down)
                  FROM domain_daily x JOIN dims p ON p.id = x.process_dim_id JOIN dims h ON h.id = x.domain_dim_id
                  WHERE x.day >= ?1 AND x.day <= ?2 AND (?3 IS NULL OR x.source_id = ?3) AND (?4 IS NULL OR x.route = ?4)
-                 GROUP BY p.key, h.key ORDER BY SUM(x.up) + SUM(x.down) DESC",
+                 GROUP BY p.key, h.key, x.route ORDER BY SUM(x.up) + SUM(x.down) DESC",
             )
             .map_err(err)?;
         let rows = stmt
             .query_map(params![from, to, source, route.map(Route::key)], |r| {
-                Ok(HostRow { process: r.get(0)?, host: r.get(1)?, bytes: bytes_at(r, 2)? })
+                Ok(HostRow { process: r.get(0)?, host: r.get(1)?, route: r.get(2)?, bytes: bytes_at(r, 3)? })
             })
             .map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
@@ -827,6 +837,19 @@ mod tests {
 
     const B: i64 = crate::domain::period::BUCKET_SECS;
 
+    /// A ranking's rows added up per key, biggest first, as the views show them.
+    fn keyed(rows: Vec<(String, String, Bytes)>) -> Vec<(String, Bytes)> {
+        let mut out: Vec<(String, Bytes)> = Vec::new();
+        for (key, _, b) in rows {
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => *v += b,
+                None => out.push((key, b)),
+            }
+        }
+        out.sort_by(|a, b| (b.1.up + b.1.down).cmp(&(a.1.up + a.1.down)).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     fn delta(source: i64, bucket: i64, up: u64, down: u64) -> BucketDelta {
         BucketDelta { source, bucket, kind: DimKind::Outbound, key: String::new(), route: String::new(), bytes: Bytes::new(up, down) }
     }
@@ -892,7 +915,7 @@ mod tests {
 
         // Act
         let store = Store::init(conn).unwrap();
-        let by_route = |kind, route| store.ranking(kind, all, None, Some(route)).unwrap();
+        let by_route = |kind, route| keyed(store.ranking(kind, all, None, Some(route)).unwrap());
 
         // Assert
         let mut routes = store.routes(all, None).unwrap();
@@ -901,7 +924,7 @@ mod tests {
         assert_eq!(by_route(DimKind::Subscription, Route::Direct), [("DIRECT".into(), Bytes::new(0, 205))]);
         assert_eq!(by_route(DimKind::Subscription, Route::Proxy), [("白月光".into(), Bytes::new(0, 600))]);
         assert!(by_route(DimKind::Process, Route::Proxy).is_empty());
-        assert_eq!(store.ranking(DimKind::Process, all, None, None).unwrap(), [("Chrome".into(), Bytes::new(0, 805))]);
+        assert_eq!(keyed(store.ranking(DimKind::Process, all, None, None).unwrap()), [("Chrome".into(), Bytes::new(0, 805))]);
         assert!(store.hosts("2026-11-16", "2026-11-16", None, Some(Route::Proxy)).unwrap().is_empty());
         assert_eq!(store.hosts("2026-11-16", "2026-11-16", None, None).unwrap().len(), 1);
         assert_eq!(store.buckets(all, None, None).unwrap(), vec![(0, Bytes::new(0, 905))]);
@@ -938,8 +961,8 @@ mod tests {
         let all = Range { start: 0, end: B };
 
         // Act
-        let direct = store.ranking(DimKind::Process, all, None, Some(Route::Direct)).unwrap();
-        let every = store.ranking(DimKind::Process, all, None, None).unwrap();
+        let direct = keyed(store.ranking(DimKind::Process, all, None, Some(Route::Direct)).unwrap());
+        let every = keyed(store.ranking(DimKind::Process, all, None, None).unwrap());
         let proxied_hosts = store.hosts("2026-11-16", "2026-11-16", None, Some(Route::Proxy)).unwrap();
 
         // Assert
@@ -1011,8 +1034,8 @@ mod tests {
         store.commit(&[dim(s, DimKind::Outbound, "HK", 6)], &[], &[]).unwrap();
 
         // Act
-        let outbound = store.ranking(DimKind::Outbound, Range { start: 0, end: B }, None, None).unwrap();
-        let process = store.ranking(DimKind::Process, Range { start: 0, end: B }, Some(s), None).unwrap();
+        let outbound = keyed(store.ranking(DimKind::Outbound, Range { start: 0, end: B }, None, None).unwrap());
+        let process = keyed(store.ranking(DimKind::Process, Range { start: 0, end: B }, Some(s), None).unwrap());
 
         // Assert
         assert_eq!(outbound, vec![("HK".to_string(), Bytes::new(0, 11)), ("DIRECT".to_string(), Bytes::new(0, 9))]);

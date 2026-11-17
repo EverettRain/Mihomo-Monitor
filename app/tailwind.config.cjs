@@ -18,6 +18,7 @@ module.exports = {
         accent: token("accent"),
         down: token("down"),
         up: token("up"),
+        route: { proxy: token("route-proxy"), direct: token("route-direct"), none: token("route-none") },
         ok: { DEFAULT: token("ok"), soft: token("ok-soft") },
         danger: { DEFAULT: token("danger"), soft: token("danger-soft") },
         warn: { DEFAULT: token("warn"), soft: token("warn-soft") },

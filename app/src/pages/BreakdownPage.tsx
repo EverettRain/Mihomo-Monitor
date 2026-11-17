@@ -8,7 +8,7 @@ import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { api, errorText, type DimKind, type HostView, type RankRow, type Route, type Source } from "@/lib/api";
-import { ROUTE_FILTERS, routeOf, useRouteFilter } from "@/lib/route";
+import { ROUTE_FILL, ROUTE_FILTERS, ROUTE_LABEL, routeOf, useRouteFilter, type RouteFilter } from "@/lib/route";
 import { bytes, cn, isoDate } from "@/lib/utils";
 
 type Tab = DimKind | "host";
@@ -84,10 +84,32 @@ const VIEWS: readonly (readonly [HostView, string])[] = [
   ["host", "原始"],
 ];
 
-function Bar({ value, max }: { value: number; max: number }) {
+/** What of a row went through a proxy, directly, or by an unknown route, in that order. */
+function routeParts(row: RankRow, filter: RouteFilter): [Route | "", number][] {
+  const value = row.up + row.down;
+  if (filter !== "all") return [[filter, value]];
+  return [
+    ["proxy", row.proxy],
+    ["direct", row.direct],
+    ["", Math.max(0, value - row.proxy - row.direct)],
+  ];
+}
+
+/**
+ * A row against the biggest one. With all traffic shown it is split by route, so a glance tells
+ * how much of it went direct; with one route shown it wears that route's color.
+ */
+function Bar({ row, max, filter }: { row: RankRow; max: number; filter: RouteFilter }) {
+  const value = row.up + row.down;
+  const parts = routeParts(row, filter).filter(([, v]) => v > 0);
   return (
     <div className="h-1.5 overflow-hidden rounded-full bg-pill">
-      <div className="h-full rounded-full bg-accent" style={{ width: `${Math.max((value / Math.max(max, 1)) * 100, value > 0 ? 1 : 0)}%` }} />
+      <div className="flex h-full gap-[2px]" style={{ width: `${Math.max((value / Math.max(max, 1)) * 100, value > 0 ? 1 : 0)}%` }}>
+        {parts.map(([route, v]) => (
+          // A sliver still shows: a little direct traffic is worth seeing.
+          <div key={route} className={cn("h-full min-w-[3px] rounded-full", ROUTE_FILL[route])} style={{ flex: `${v} 1 0` }} />
+        ))}
+      </div>
     </div>
   );
 }
@@ -103,9 +125,11 @@ function Row({
   indent,
   onAdd,
   rule,
+  filter,
 }: {
   tab: Tab;
   row: RankRow;
+  filter: RouteFilter;
   /** The process name comes from an attribution rule. */
   rule?: boolean;
   total: number;
@@ -126,7 +150,12 @@ function Row({
       onClick={expandable ? onToggle : undefined}
       onKeyDown={expandable ? (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onToggle?.()) : undefined}
       aria-expanded={expandable ? open : undefined}
-      title={`下载 ${bytes(row.down)} · 上传 ${bytes(row.up)}`}
+      title={[
+        `下载 ${bytes(row.down)} · 上传 ${bytes(row.up)}`,
+        filter === "all" ? routeParts(row, filter).filter(([, n]) => n > 0).map(([r, n]) => `${ROUTE_LABEL[r]} ${bytes(n)}`).join(" · ") : "",
+      ]
+        .filter(Boolean)
+        .join("\n")}
       className={cn(
         "group grid w-full grid-cols-[minmax(0,1fr)_minmax(80px,28%)_5.5rem_3.25rem_1.75rem] items-center gap-3 py-1.5 pl-4 pr-2 text-left text-[12.5px] outline-none",
         expandable && "cursor-pointer hover:bg-pill/60 focus-visible:bg-pill/60",
@@ -139,7 +168,7 @@ function Row({
         {row.group && <Tag>分组</Tag>}
         {rule && <Tag>规则</Tag>}
       </span>
-      <Bar value={v} max={max} />
+      <Bar row={row} max={max} filter={filter} />
       <span className="text-right font-mono tabular-nums">{bytes(v)}</span>
       <span className="text-right font-mono tabular-nums text-muted">{total > 0 ? `${((v / total) * 100).toFixed(1)}%` : "—"}</span>
       <span className="flex h-[18px] items-center justify-end">
@@ -204,7 +233,7 @@ function SubHosts({
   return (
     <div className="bg-card-2 py-1">
       {rows.slice(0, 15).map((r) => (
-        <Row key={`${r.group}${r.key}`} tab="host" row={r} total={total} max={max} indent onAdd={() => onAdd(r.key)} />
+        <Row key={`${r.group}${r.key}`} tab="host" row={r} total={total} max={max} indent filter={route ?? "all"} onAdd={() => onAdd(r.key)} />
       ))}
     </div>
   );
@@ -303,7 +332,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
               )}
             </div>
             <div className="mb-1.5 px-4">
-              <RouteShare from={from} to={to} source={source} filter={route} version={rows} />
+              <RouteShare from={from} to={to} source={source} filter={route} version={rows} swatches />
             </div>
             {onlyUnknown && (
               <p className="mx-4 mb-2 rounded-lg bg-warn-soft px-3 py-2 text-[12px] leading-[18px] text-warn">
@@ -326,6 +355,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
                     <div key={id}>
                       <Row
                         tab={tab}
+                        filter={route}
                         row={r}
                         total={total}
                         max={max}

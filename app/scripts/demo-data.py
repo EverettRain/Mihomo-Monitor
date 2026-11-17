@@ -52,12 +52,20 @@ def main():
     # Each program as the app records it: a rule names what the core could not. Programs that go
     # out directly in fake-mihomo.py are direct, the rest go through a proxy.
     named = {inbound: name for name, inbound, _, on in RULES if on}
+
+    def host_share(hosts, i):
+        return 0.6**i / sum(0.6**j for j in range(len(hosts)))
+
+    def host_route(program, host):
+        return "direct" if program in fake.DIRECT_PROGRAMS or host in fake.DIRECT_SITES else "proxy"
+
+    # (name as recorded, weight, hosts, dedicated inbound, share of it that goes direct)
     programs = []
     for i, (name, w, hosts) in enumerate(fake.PROGRAMS):
         inbound = fake.DEDICATED_INBOUND.get(i)
-        route = "direct" if name in fake.DIRECT_HOSTS else "proxy"
-        programs.append((name or named.get(inbound, ""), w, hosts, inbound, route))
-    direct_share = sum(w for name, w, _ in fake.PROGRAMS if name in fake.DIRECT_HOSTS) / sum(w for _, w, _ in fake.PROGRAMS)
+        direct = sum(host_share(hosts, j) for j, h in enumerate(hosts) if host_route(name, h) == "direct")
+        programs.append((name or named.get(inbound, ""), w, hosts, inbound, direct))
+    direct_share = sum(w * d for _, w, _, _, d in programs) / sum(w for _, w, _, _, _ in programs)
 
     # Each kind's shares as (key, route) -> weight.
     def add(table, key, route, w):
@@ -65,10 +73,13 @@ def main():
 
     inbounds = {}
     processes = {}
-    for name, w, _, inbound, route in programs:
-        add(processes, name, route, w)
-        for inb, iw in [(inbound, 1)] if inbound else fake.INBOUNDS:
-            add(inbounds, inb, route, w * iw)
+    for name, w, _, inbound, direct in programs:
+        for route, part in (("proxy", 1 - direct), ("direct", direct)):
+            if part <= 0:
+                continue
+            add(processes, name, route, w * part)
+            for inb, iw in [(inbound, 1)] if inbound else fake.INBOUNDS:
+                add(inbounds, inb, route, w * part * iw)
     shares = {
         "outbound": {**{(n, "proxy"): (1 - direct_share) * w for n, _, w in fake.NODES}, ("DIRECT", "direct"): direct_share},
         "subscription": {("白月光", "proxy"): (1 - direct_share) * 0.8, ("备用机场", "proxy"): (1 - direct_share) * 0.2, ("DIRECT", "direct"): direct_share},
@@ -116,9 +127,10 @@ def main():
             # Hosts cover what the listed connections carried: the day's traffic minus the unseen part.
             seen_up, seen_down = day_up * (1 - fake.UNSEEN), day_down * (1 - fake.UNSEEN)
             day = time.strftime("%Y-%m-%d", time.localtime(day_start))
-            for name, w, hosts, _, route in programs:
+            for (name, w, hosts, _, _), (core_name, _, _) in zip(programs, fake.PROGRAMS):
                 for i, host in enumerate(hosts):
-                    f = w * (0.6 ** i) / sum(0.6 ** j for j in range(len(hosts))) * random.uniform(0.9, 1.1)
+                    f = w * host_share(hosts, i) * random.uniform(0.9, 1.1)
+                    route = host_route(core_name, host)
                     host_rows.append((source, day, ids[("process", name)], dim("domain", host), route, int(seen_up * f), int(seen_down * f)))
     db.executemany(
         "INSERT INTO traffic (source_id, bucket, dim_id, route, up, down) VALUES (?, ?, ?, ?, ?, ?)"

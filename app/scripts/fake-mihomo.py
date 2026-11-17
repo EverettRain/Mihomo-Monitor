@@ -28,7 +28,7 @@ VERSION = {"meta": True, "version": "v1.19.31"}
 
 # Programs, the hosts they talk to, and how much of the traffic they make.
 PROGRAMS = [
-    ("Google Chrome", 0.38, ["www.youtube.com", "rr3---sn-a5mekn6d.googlevideo.com", "i.ytimg.com", "www.google.com", "github.com"]),
+    ("Google Chrome", 0.38, ["www.youtube.com", "www.bilibili.com", "rr3---sn-a5mekn6d.googlevideo.com", "i.ytimg.com", "www.google.com", "github.com"]),
     ("Safari", 0.14, ["www.apple.com", "news.ycombinator.com", "developer.mozilla.org"]),
     ("Telegram", 0.10, ["149.154.167.51", "cdn4.telesco.pe"]),
     ("Code", 0.08, ["marketplace.visualstudio.com", "objects.githubusercontent.com"]),
@@ -48,7 +48,10 @@ NODES = [
     ("🇺🇸 美国 03", "白月光", 0.15),
     ("🇸🇬 新加坡 01", "备用机场", 0.20),
 ]
-DIRECT_HOSTS = {"WeChat", "Steam", ""}
+# Programs that always go out directly, and sites any program reaches directly (rules sending
+# domestic sites DIRECT), so a browser has traffic both ways.
+DIRECT_PROGRAMS = {"WeChat", "Steam", ""}
+DIRECT_SITES = {"www.bilibili.com"}
 INBOUNDS = [("DEFAULT-MIXED", 0.7), ("DEFAULT-TUN", 0.3)]
 # Share of the traffic carried by connections that open and close between two reads.
 UNSEEN = 0.08
@@ -105,7 +108,7 @@ class Core:
         index = pick(range(len(PROGRAMS)), lambda i: PROGRAMS[i][1])
         program, share, hosts = PROGRAMS[index]
         host = random.choice(hosts)
-        if program in DIRECT_HOSTS:
+        if program in DIRECT_PROGRAMS or host in DIRECT_SITES:
             chains, providers = ["DIRECT"], [""]
         else:
             node, provider, _ = pick(NODES, lambda o: o[2])

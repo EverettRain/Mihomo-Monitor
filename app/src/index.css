@@ -27,6 +27,11 @@
     /* Chart series (validated pair, dataviz reference palette slots 1-2): download, upload. */
     --down: 42 120 214;
     --up: 235 104 52;
+    /* Routes in the breakdown bars (dataviz palette slots 1 and 3; orange is upload): through a
+       proxy, direct, and a neutral gray for traffic whose route is unknown. */
+    --route-proxy: 42 120 214;
+    --route-direct: 27 175 122;
+    --route-none: 180 180 188;
     --ok: 24 154 88;
     --ok-soft: 228 246 236;
     --danger: 214 69 69;
@@ -59,6 +64,9 @@
     --accent: 57 135 229;
     --down: 57 135 229;
     --up: 217 89 38;
+    --route-proxy: 57 135 229;
+    --route-direct: 25 158 112;
+    --route-none: 98 98 108;
     --ok: 111 217 155;
     --ok-soft: 28 52 39;
     --danger: 242 139 130;

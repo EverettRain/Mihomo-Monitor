@@ -12,6 +12,9 @@ export const ROUTE_FILTERS: readonly (readonly [RouteFilter, string])[] = [
 
 export const ROUTE_LABEL: Record<Route | "", string> = { proxy: "经代理", direct: "直连", "": "未区分" };
 
+/** Fill of each route in the breakdown bars; the empty route is traffic whose route is unknown. */
+export const ROUTE_FILL: Record<Route | "", string> = { proxy: "bg-route-proxy", direct: "bg-route-direct", "": "bg-route-none" };
+
 const KEY = "mihomo-monitor.route";
 
 function read(): RouteFilter {
