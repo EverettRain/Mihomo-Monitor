@@ -29,6 +29,8 @@ pub struct Settings {
     pub manual_sources: Vec<ManualSource>,
     /// How often each core's connections are read, in milliseconds.
     pub sample_ms: u64,
+    /// The rule configuration in use (host groups and attribution rules).
+    pub rules_profile: String,
 }
 
 /// The sampling intervals offered, in milliseconds. Shorter misses fewer connections that open
@@ -53,6 +55,7 @@ impl Default for Settings {
             auto_discover: true,
             manual_sources: Vec::new(),
             sample_ms: 1_000,
+            rules_profile: crate::infra::profiles::DEFAULT.to_string(),
         }
     }
 }

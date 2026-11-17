@@ -168,6 +168,11 @@ def main():
         [(name, inbound, priority, int(on)) for name, inbound, priority, on in RULES],
     )
     db.commit()
+    # Once it has run, the app keeps groups and rules in a configuration file, which wins over
+    # the database; without it, the next start writes one from what was just added.
+    stale = os.path.join(os.path.dirname(os.path.abspath(db_path)), "rules", "Default.yaml")
+    if os.path.exists(stale):
+        os.remove(stale)
     print(f"added {len(rows)} traffic rows and {len(host_rows)} host rows to source {source}")
 
 

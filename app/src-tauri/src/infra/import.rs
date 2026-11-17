@@ -307,7 +307,7 @@ fn yaml_entries(text: &str, out: &mut Parsed) {
         out.problems.push(Problem {
             at: 0,
             text: String::new(),
-            reason: "这是规则配置文件（分组与归属规则），请用「配置文件」导入".into(),
+            reason: "这是配置文件（分组与归属规则），请在「域名分组」页的「切换配置」里导入为新配置".into(),
         });
         return;
     }

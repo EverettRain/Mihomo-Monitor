@@ -5,7 +5,7 @@ mod tray;
 mod window;
 
 use crate::infra::{
-    paths, settings,
+    paths, profiles, settings,
     store::{Store, SCHEMA_VERSION},
 };
 use crate::service::monitor::{Alert, Event, Monitor, FLUSH_EVERY};
@@ -135,9 +135,14 @@ pub fn run(start_in_tray: bool) {
             commands::delete_rules,
             commands::import_preview,
             commands::import_apply,
-            commands::export_rules_file,
-            commands::plan_rules_file,
-            commands::apply_rules_file,
+            commands::rules_profile,
+            commands::rules_profiles,
+            commands::switch_rules_profile,
+            commands::create_rules_profile,
+            commands::import_rules_profile,
+            commands::delete_rules_profile,
+            commands::open_rules_profile,
+            commands::reveal_rules_profile,
             commands::subscriptions,
             commands::save_cycle,
             commands::delete_cycle,
@@ -162,7 +167,15 @@ pub fn run(start_in_tray: bool) {
             }
             let store = Store::open(&paths::database_path()).inspect_err(|e| paths::log(e))?;
             let monitor = Monitor::new(store, sink(handle.clone()));
-            monitor.set_sample_interval(settings::load().sample_ms);
+            let s = settings::load();
+            monitor.set_sample_interval(s.sample_ms);
+            match monitor.open_profiles(profiles::dir_in(&paths::data_dir()), &s.rules_profile) {
+                Ok(name) if name != s.rules_profile => {
+                    let _ = settings::update(|s| s.rules_profile = name);
+                }
+                Ok(_) => {}
+                Err(e) => paths::log(&format!("无法打开规则配置：{e}")),
+            }
             app.manage(monitor.clone());
             tray::build(&handle)?;
             first_launch_autostart(&handle);

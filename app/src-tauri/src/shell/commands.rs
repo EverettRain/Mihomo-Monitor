@@ -12,7 +12,8 @@ use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
 use crate::infra::store::{Added, CycleRow, HostGroupRow};
 use crate::service::monitor::{
-    AddResult, Bounds, HostView, LivePoint, Monitor, Overview, PeriodRow, RankRow, RulesPlan, SourceView, SubscriptionView,
+    AddResult, Bounds, HostView, LivePoint, Monitor, Overview, PeriodRow, ProfileSummary, ProfileView, RankRow, SourceView,
+    SubscriptionView,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -257,21 +258,52 @@ pub fn import_apply(monitor: Mon, entries: Vec<Entry>, default_group: String) ->
     monitor.import_apply(entries, &default_group)
 }
 
-/// The host groups and attribution rules as one rules file.
+/// The rule configuration in use, read again when its file was edited outside the app.
 #[tauri::command]
-pub async fn export_rules_file(monitor: Mon<'_>) -> Result<String, String> {
-    off_main(monitor, move |m| m.export_rules_file()).await
-}
-
-/// What importing a rules file would change.
-#[tauri::command]
-pub async fn plan_rules_file(monitor: Mon<'_>, text: String, keep_others: bool) -> Result<RulesPlan, String> {
-    off_main(monitor, move |m| m.plan_rules_file(&text, keep_others)).await
+pub async fn rules_profile(monitor: Mon<'_>) -> Result<ProfileView, String> {
+    off_main(monitor, |m| m.sync_profile()).await
 }
 
 #[tauri::command]
-pub fn apply_rules_file(monitor: Mon, text: String, keep_others: bool) -> Result<RulesPlan, String> {
-    monitor.apply_rules_file(&text, keep_others)
+pub async fn rules_profiles(monitor: Mon<'_>) -> Result<Vec<ProfileSummary>, String> {
+    off_main(monitor, |m| m.profiles()).await
+}
+
+#[tauri::command]
+pub fn switch_rules_profile(monitor: Mon, name: String) -> Result<(), String> {
+    let name = monitor.switch_profile(&name)?;
+    settings::update(|s| s.rules_profile = name).map(|_| ())
+}
+
+/// Adds a configuration, empty or as a copy of the one in use.
+#[tauri::command]
+pub fn create_rules_profile(monitor: Mon, name: String, copy: bool) -> Result<String, String> {
+    monitor.create_profile(&name, copy)
+}
+
+/// Adds a configuration from the text of a rules file.
+#[tauri::command]
+pub fn import_rules_profile(monitor: Mon, name: String, text: String) -> Result<String, String> {
+    monitor.import_profile(&name, &text)
+}
+
+#[tauri::command]
+pub fn delete_rules_profile(monitor: Mon, name: String) -> Result<(), String> {
+    monitor.delete_profile(&name)
+}
+
+/// Opens the configuration in use with the system's editor for it.
+#[tauri::command]
+pub fn open_rules_profile(app: AppHandle, monitor: Mon) -> Result<(), String> {
+    let path = monitor.profile_path().ok_or("配置还没有打开。")?;
+    app.opener().open_path(path.display().to_string(), None::<&str>).map_err(|e| format!("无法打开配置文件：{e}"))
+}
+
+/// Shows the configuration in use in Finder or Explorer.
+#[tauri::command]
+pub fn reveal_rules_profile(app: AppHandle, monitor: Mon) -> Result<(), String> {
+    let path = monitor.profile_path().ok_or("配置还没有打开。")?;
+    app.opener().reveal_item_in_dir(path).map_err(|e| format!("无法显示配置文件：{e}"))
 }
 
 #[tauri::command]

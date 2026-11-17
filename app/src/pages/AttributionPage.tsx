@@ -1,7 +1,7 @@
-import { FileCog, Loader2, Plus, Signpost, Trash2 } from "lucide-react";
+import { Loader2, Plus, Signpost, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
-import { RulesFileDialog } from "@/components/RulesFileDialog";
+import { describeChanges } from "@/components/RulesProfilePanel";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
@@ -9,7 +9,7 @@ import { Input, Label, Select } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type AttributionField, type AttributionRule } from "@/lib/api";
-import { useOnShow } from "@/lib/pageActive";
+import { useOnShow, usePageActive } from "@/lib/pageActive";
 import { isoDate } from "@/lib/utils";
 
 const FIELD_LABEL: Record<AttributionField, string> = { inbound: "入站名称" };
@@ -154,10 +154,16 @@ export function AttributionPage() {
   const [rules, setRules] = useState<AttributionRule[] | null>(null);
   const [editing, setEditing] = useState<{ open: boolean; rule: AttributionRule | null }>({ open: false, rule: null });
   const [deleting, setDeleting] = useState<AttributionRule | null>(null);
-  const [rulesFile, setRulesFile] = useState(false);
+  const [profile, setProfile] = useState<string | null>(null);
+  const visible = usePageActive();
 
+  // The configuration file comes first: edited outside the app, it is read again here.
   const load = useCallback(async () => {
     try {
+      const p = await api.rulesProfile();
+      setProfile(p.name);
+      const changed = describeChanges(p.changed);
+      if (changed) toast(changed);
       setRules(await api.attributionRules());
     } catch (e) {
       toast(errorText(e), "error");
@@ -168,6 +174,12 @@ export function AttributionPage() {
     void load();
   }, [load]);
   useOnShow(load);
+  useEffect(() => {
+    if (!visible) return;
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [load, visible]);
 
   const toggle = async (r: AttributionRule, enabled: boolean) => {
     try {
@@ -198,10 +210,6 @@ export function AttributionPage() {
         subtitle="给内核没有识别出进程的流量起名字，例如容器或局域网设备经专用入站进来的流量。"
         actions={
           <>
-            <Button size="sm" variant="outline" onClick={() => setRulesFile(true)}>
-              <FileCog />
-              配置文件
-            </Button>
             <Button size="sm" onClick={create}>
               <Plus />
               新建规则
@@ -252,6 +260,7 @@ export function AttributionPage() {
           </Group>
         )}
         <p className="mt-5 px-1 text-[11.5px] leading-relaxed text-muted">
+          {profile && `规则和域名分组一起保存在配置「${profile}」里，可以在「域名分组」页切换配置或打开文件直接编辑。`}
           规则只用于内核读到了连接、但没有给出进程名的流量；内核识别出的进程名始终保留，也不会根据 127.0.0.1 或访问的域名去猜是哪个程序。
           命中规则的流量在分布页的进程排行和它的域名明细里以规则的名称出现，只是换了归属，总量不变。
           新建或修改规则只影响之后读到的流量，已经记录的不会改写。
@@ -264,7 +273,6 @@ export function AttributionPage() {
         onClose={() => setEditing({ open: false, rule: null })}
         onSaved={() => void load()}
       />
-      <RulesFileDialog open={rulesFile} onClose={() => setRulesFile(false)} onDone={() => void load()} />
       <Dialog
         open={deleting !== null}
         onClose={() => setDeleting(null)}

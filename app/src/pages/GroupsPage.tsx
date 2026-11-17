@@ -1,14 +1,14 @@
-import { ChevronLeft, FileCog, FolderPlus, Loader2, Pencil, Plus, Search, Tags, Trash2, Upload } from "lucide-react";
+import { ChevronLeft, FolderPlus, Loader2, Pencil, Plus, Search, Tags, Trash2, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ImportDialog } from "@/components/ImportDialog";
-import { RulesFileDialog } from "@/components/RulesFileDialog";
+import { describeChanges, RulesProfilePanel } from "@/components/RulesProfilePanel";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
-import { api, errorText, type HostGroup, type HostRule, type RuleKind } from "@/lib/api";
+import { api, errorText, type HostGroup, type HostRule, type RuleKind, type RulesProfile } from "@/lib/api";
 import { useOnShow, usePageActive } from "@/lib/pageActive";
 import { KIND_LABEL, KINDS } from "@/lib/hostgroup";
 
@@ -292,10 +292,16 @@ export function GroupsPage() {
   const [selected, setSelected] = useState<number | null>(null);
   const [editing, setEditing] = useState<{ open: boolean; group: HostGroup | null }>({ open: false, group: null });
   const [importing, setImporting] = useState<{ open: boolean; preset: number | null }>({ open: false, preset: null });
-  const [rulesFile, setRulesFile] = useState(false);
+  const [profile, setProfile] = useState<RulesProfile | null>(null);
+  const visible = usePageActive();
 
+  // The configuration file comes first: edited outside the app, it is read again here.
   const load = useCallback(async () => {
     try {
+      const p = await api.rulesProfile();
+      setProfile(p);
+      const changed = describeChanges(p.changed);
+      if (changed) toast(changed);
       const g = await api.hostGroups();
       setGroups(g);
       // A group deleted elsewhere closes its page.
@@ -309,6 +315,13 @@ export function GroupsPage() {
     void load();
   }, [load]);
   useOnShow(load);
+  // Back from editing the file in another app.
+  useEffect(() => {
+    if (!visible) return;
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [load, visible]);
 
   const current = groups?.find((g) => g.id === selected) ?? null;
   const back = useCallback(() => setSelected(null), []);
@@ -349,10 +362,6 @@ export function GroupsPage() {
               <Upload />
               导入
             </Button>
-            <Button size="sm" variant="outline" onClick={() => setRulesFile(true)}>
-              <FileCog />
-              配置文件
-            </Button>
             <Button size="sm" onClick={() => setEditing({ open: true, group: null })}>
               <FolderPlus />
               新建分组
@@ -361,6 +370,7 @@ export function GroupsPage() {
         }
       />
       <div className="px-5">
+        <RulesProfilePanel profile={profile} onChanged={() => void load()} />
         {groups === null ? (
           <div className="flex items-center gap-2 px-1 text-[12.5px] text-muted">
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -416,7 +426,6 @@ export function GroupsPage() {
         }}
       />
       <ImportDialog open={importing.open} groups={groups ?? []} preset={importing.preset} onClose={() => setImporting({ open: false, preset: null })} onDone={() => void load()} />
-      <RulesFileDialog open={rulesFile} onClose={() => setRulesFile(false)} onDone={() => void load()} />
     </Page>
   );
 }

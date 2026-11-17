@@ -13,6 +13,7 @@ use crate::domain::period::{self, bucket_of, Period, Range};
 use crate::domain::split::{self, DimKey, DimKind, Dims, HostKey, OutboundTypes, Route, Tracker};
 use crate::infra::import::{self, Entry, Format, Parsed, Problem};
 use crate::infra::mihomo::Client;
+use crate::infra::profiles;
 use crate::infra::rules_file::{self, GroupSpec, RulesFile};
 use crate::infra::store::{Added, BucketDelta, CycleRow, HostDelta, HostGroupRow, Store};
 use crate::infra::{discovery, paths, settings, verge};
@@ -21,6 +22,7 @@ use jiff::tz::TimeZone;
 use jiff::ZonedDateTime;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -333,7 +335,31 @@ pub struct PartPlan {
     pub unchanged: usize,
 }
 
-/// What importing a rules file changes; a part the file leaves out is `None` and stays as it is.
+/// The rule configuration in use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileView {
+    pub name: String,
+    pub path: String,
+    pub groups: usize,
+    pub rules: usize,
+    /// What reading its file again changed, when it was edited outside the app.
+    pub changed: Option<RulesPlan>,
+    /// Why its file could not be read; the groups and rules stay as they were.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub name: String,
+    pub active: bool,
+    pub groups: usize,
+    pub rules: usize,
+    pub error: Option<String>,
+}
+
+/// What putting a rules file in place changes; a part the file leaves out is `None` and stays.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RulesPlan {
@@ -424,6 +450,24 @@ pub struct Monitor {
     attributor: Mutex<Option<Arc<Attributor>>>,
     /// How often connections are read, in milliseconds; a change applies from the next reading.
     sample_ms: std::sync::atomic::AtomicU64,
+    /// The rule configuration in use, once opened.
+    profile: Mutex<Option<Profile>>,
+}
+
+/// The rule configuration in use: its file, and a fingerprint of what was last read from or
+/// written to it, to tell when it was edited outside the app.
+struct Profile {
+    dir: PathBuf,
+    name: String,
+    seen: u64,
+}
+
+fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    // Zero stands for "not read yet".
+    h.finish().max(1)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -457,6 +501,7 @@ impl Monitor {
             matcher: Mutex::new(None),
             attributor: Mutex::new(None),
             sample_ms: std::sync::atomic::AtomicU64::new(settings::sample_ms(0)),
+            profile: Mutex::new(None),
         })
     }
 
@@ -1264,13 +1309,13 @@ impl Monitor {
         let rule = rule.checked()?;
         let result = lock(&self.store).save_attribution_rule(&rule);
         *lock(&self.attributor) = None;
-        result
+        self.saved(result)
     }
 
     pub fn delete_attribution_rule(&self, id: i64) -> Result<(), String> {
         let result = lock(&self.store).delete_attribution_rule(id);
         *lock(&self.attributor) = None;
-        result
+        self.saved(result)
     }
 
     fn matcher(&self) -> Result<Arc<Matcher>, String> {
@@ -1285,10 +1330,11 @@ impl Monitor {
     }
 
     /// Runs a change to the host groups and drops the compiled matcher.
+    /// Runs a change to the host groups, drops the compiled matcher and writes the configuration.
     fn change_groups<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
         let result = f(&mut lock(&self.store));
         *lock(&self.matcher) = None;
-        result
+        self.saved(result)
     }
 
     pub fn host_groups(&self) -> Result<Vec<HostGroupRow>, String> {
@@ -1374,10 +1420,8 @@ impl Monitor {
         Ok((file, problems))
     }
 
-    /// What importing a rules file would change. With `keep_others`, what the file does not
-    /// name stays; otherwise it goes.
-    pub fn plan_rules_file(&self, text: &str, keep_others: bool) -> Result<RulesPlan, String> {
-        let (file, problems) = Self::read_rules_file(text)?;
+    /// What putting `file` in place of the current groups and rules would change.
+    fn plan_of(&self, file: &RulesFile, problems: Vec<Problem>) -> Result<RulesPlan, String> {
         let store = lock(&self.store);
         let groups = match &file.groups {
             None => None,
@@ -1398,9 +1442,7 @@ impl Monitor {
                         }
                     }
                 }
-                if !keep_others {
-                    plan.removed = now.into_iter().filter(|n| !wanted.iter().any(|g| g.name == n.name)).map(|n| n.name).collect();
-                }
+                plan.removed = now.into_iter().filter(|n| !wanted.iter().any(|g| g.name == n.name)).map(|n| n.name).collect();
                 Some(plan)
             }
         };
@@ -1418,22 +1460,158 @@ impl Monitor {
                         Some(_) => plan.unchanged += 1,
                     }
                 }
-                if !keep_others {
-                    plan.removed = now.iter().filter(|n| !wanted.iter().any(|r| same(n, r))).map(label).collect();
-                }
+                plan.removed = now.iter().filter(|n| !wanted.iter().any(|r| same(n, r))).map(label).collect();
                 Some(plan)
             }
         };
         Ok(RulesPlan { groups, attribution, problems })
     }
 
-    /// Imports a rules file (see `plan_rules_file`); returns what it changed.
-    pub fn apply_rules_file(&self, text: &str, keep_others: bool) -> Result<RulesPlan, String> {
-        let plan = self.plan_rules_file(text, keep_others)?;
-        let (file, _) = Self::read_rules_file(text)?;
-        self.change_groups(|s| s.apply_rules(file.groups.as_deref(), file.attribution.as_deref(), keep_others, paths::now_secs()))?;
+    /// Puts a configuration's groups and rules in place of the current ones. The file it came
+    /// from is not written back: what the user wrote there stays as written.
+    fn put_file(&self, file: &RulesFile) -> Result<(), String> {
+        lock(&self.store).apply_rules(file.groups.as_deref(), file.attribution.as_deref(), paths::now_secs())?;
+        *lock(&self.matcher) = None;
         *lock(&self.attributor) = None;
-        Ok(plan)
+        Ok(())
+    }
+
+    /// Opens the configurations in `dir` and puts `wanted` in use, or the default one when it is
+    /// gone. The first time, the groups and rules the database holds become the default
+    /// configuration, so nothing is lost. Returns the name in use.
+    pub fn open_profiles(&self, dir: PathBuf, wanted: &str) -> Result<String, String> {
+        let names = profiles::list(&dir);
+        let name = if names.iter().any(|n| n == wanted) {
+            wanted.to_string()
+        } else {
+            if !names.iter().any(|n| n == profiles::DEFAULT) {
+                profiles::write(&dir, profiles::DEFAULT, &self.export_rules_file()?)?;
+            }
+            profiles::DEFAULT.to_string()
+        };
+        *lock(&self.profile) = Some(Profile { dir, name: name.clone(), seen: 0 });
+        if let Some(e) = self.sync_profile()?.error {
+            paths::log(&format!("配置「{name}」无法读取，沿用上次的分组与规则：{e}"));
+        }
+        Ok(name)
+    }
+
+    /// The configuration in use, read again when its file changed since it was last read or
+    /// written (edited outside the app). A file that cannot be read leaves the groups and rules
+    /// as they were and says why; one that is gone is written again from them.
+    pub fn sync_profile(&self) -> Result<ProfileView, String> {
+        let Some((dir, name, seen)) = lock(&self.profile).as_ref().map(|p| (p.dir.clone(), p.name.clone(), p.seen)) else {
+            return Err("配置还没有打开。".into());
+        };
+        let path = profiles::path_of(&dir, &name);
+        if !path.exists() {
+            self.save_profile()?;
+        }
+        let text = profiles::read(&dir, &name)?;
+        let mut view =
+            ProfileView { name: name.clone(), path: path.display().to_string(), groups: 0, rules: 0, changed: None, error: None };
+        if fingerprint(&text) != seen {
+            match Self::read_rules_file(&text) {
+                Err(e) => view.error = Some(e),
+                Ok((file, problems)) => {
+                    let plan = self.plan_of(&file, problems)?;
+                    self.put_file(&file)?;
+                    if let Some(p) = lock(&self.profile).as_mut().filter(|p| p.name == name) {
+                        p.seen = fingerprint(&text);
+                    }
+                    // The first reading is not a change anyone made.
+                    view.changed = (seen != 0).then_some(plan);
+                }
+            }
+        }
+        let store = lock(&self.store);
+        view.groups = store.host_groups()?.len();
+        view.rules = store.attribution_rules()?.len();
+        Ok(view)
+    }
+
+    /// Writes the groups and rules to the configuration in use, after a change made in the app.
+    fn save_profile(&self) -> Result<(), String> {
+        let Some((dir, name)) = lock(&self.profile).as_ref().map(|p| (p.dir.clone(), p.name.clone())) else { return Ok(()) };
+        let text = self.export_rules_file()?;
+        profiles::write(&dir, &name, &text)?;
+        if let Some(p) = lock(&self.profile).as_mut().filter(|p| p.name == name) {
+            p.seen = fingerprint(&text);
+        }
+        Ok(())
+    }
+
+    /// After a change in the app: the change is made; failing to write the file only logs.
+    fn saved<T>(&self, result: Result<T, String>) -> Result<T, String> {
+        if result.is_ok() {
+            if let Err(e) = self.save_profile() {
+                paths::log(&format!("无法写入配置文件：{e}"));
+            }
+        }
+        result
+    }
+
+    /// Every configuration, with how many groups and rules it holds.
+    pub fn profiles(&self) -> Result<Vec<ProfileSummary>, String> {
+        let Some((dir, active)) = lock(&self.profile).as_ref().map(|p| (p.dir.clone(), p.name.clone())) else { return Ok(Vec::new()) };
+        Ok(profiles::list(&dir)
+            .into_iter()
+            .map(|name| {
+                let read = profiles::read(&dir, &name).and_then(|t| rules_file::parse(&t));
+                let (groups, rules, error) = match read {
+                    Ok((f, _)) => (f.groups.map_or(0, |g| g.len()), f.attribution.map_or(0, |a| a.len()), None),
+                    Err(e) => (0, 0, Some(e)),
+                };
+                ProfileSummary { active: name == active, name, groups, rules, error }
+            })
+            .collect())
+    }
+
+    /// Puts another configuration in use. One that cannot be read is not switched to.
+    pub fn switch_profile(&self, name: &str) -> Result<String, String> {
+        let dir = lock(&self.profile).as_ref().map(|p| p.dir.clone()).ok_or("配置还没有打开。")?;
+        let text = profiles::read(&dir, name)?;
+        let (file, _) = Self::read_rules_file(&text)?;
+        self.put_file(&file)?;
+        *lock(&self.profile) = Some(Profile { dir, name: name.to_string(), seen: fingerprint(&text) });
+        Ok(name.to_string())
+    }
+
+    /// Adds a configuration: empty, or a copy of the one in use.
+    pub fn create_profile(&self, name: &str, copy: bool) -> Result<String, String> {
+        let name = profiles::checked_name(name)?;
+        let dir = lock(&self.profile).as_ref().map(|p| p.dir.clone()).ok_or("配置还没有打开。")?;
+        if profiles::path_of(&dir, &name).exists() {
+            return Err(format!("已经有名为「{name}」的配置。"));
+        }
+        let text = if copy { self.export_rules_file()? } else { rules_file::render(&[], &[]) };
+        profiles::write(&dir, &name, &text)?;
+        Ok(name)
+    }
+
+    /// Adds a configuration from a rules file's text, kept as written.
+    pub fn import_profile(&self, name: &str, text: &str) -> Result<String, String> {
+        let name = profiles::checked_name(name)?;
+        let dir = lock(&self.profile).as_ref().map(|p| p.dir.clone()).ok_or("配置还没有打开。")?;
+        if profiles::path_of(&dir, &name).exists() {
+            return Err(format!("已经有名为「{name}」的配置。"));
+        }
+        Self::read_rules_file(text)?;
+        profiles::write(&dir, &name, text)?;
+        Ok(name)
+    }
+
+    pub fn delete_profile(&self, name: &str) -> Result<(), String> {
+        let (dir, active) = lock(&self.profile).as_ref().map(|p| (p.dir.clone(), p.name.clone())).ok_or("配置还没有打开。")?;
+        if name == active {
+            return Err("正在使用的配置不能删除，先切换到其他配置。".into());
+        }
+        profiles::delete(&dir, name)
+    }
+
+    /// The file of the configuration in use.
+    pub fn profile_path(&self) -> Option<PathBuf> {
+        lock(&self.profile).as_ref().map(|p| profiles::path_of(&p.dir, &p.name))
     }
 
     /// Today's traffic of every source, for the tray.
@@ -1775,59 +1953,85 @@ mod tests {
         assert_eq!(unnamed.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("api.example.com", 300)]);
     }
 
-    #[test]
-    fn a_rules_file_replaces_or_merges_groups_and_rules() {
-        // Arrange: groups A and B and one rule; the file edits A, adds C, renames the rule and
-        // adds another; B is not in it.
-        let fresh = || {
-            let (m, _) = monitor_with_source();
-            let a = m.create_group("A", "").unwrap();
-            m.add_rules(a, "a.com").unwrap();
-            let b = m.create_group("B", "旧备注").unwrap();
-            m.add_rules(b, "b.com").unwrap();
-            let rule = |name: &str, inbound: &str| AttributionRule {
-                id: None,
-                name: name.into(),
-                field: crate::domain::attribution::Field::Inbound,
-                value: inbound.into(),
-                priority: 10,
-                enabled: true,
-            };
-            m.save_attribution_rule(rule("容器", "Port-1")).unwrap();
-            m
-        };
-        let file = "groups:\n  - name: C\n    entries: [c.com]\n  - name: A\n    entries: [a.com, 'DOMAIN,www.a.com']\nattribution:\n  - name: 容器 1\n    inbound: Port-1\n    priority: 10\n  - name: NAS\n    inbound: Port-2\n";
-        let names = |m: &Monitor| m.host_groups().unwrap().into_iter().map(|g| (g.name, g.rules.len())).collect::<Vec<_>>();
+    /// A monitor with group A (a.com) and one attribution rule, its configurations in `dir`.
+    fn monitor_with_rules(dir: &std::path::Path) -> Arc<Monitor> {
+        let (m, _) = monitor_with_source();
+        let a = m.create_group("A", "").unwrap();
+        m.add_rules(a, "a.com").unwrap();
+        m.save_attribution_rule(AttributionRule {
+            id: None,
+            name: "容器".into(),
+            field: crate::domain::attribution::Field::Inbound,
+            value: "Port-1".into(),
+            priority: 10,
+            enabled: true,
+        })
+        .unwrap();
+        m.open_profiles(dir.to_path_buf(), profiles::DEFAULT).unwrap();
+        m
+    }
 
-        // Act
-        let replace = fresh();
-        let plan = replace.plan_rules_file(file, false).unwrap();
-        replace.apply_rules_file(file, false).unwrap();
-        let merge = fresh();
-        let merged = merge.apply_rules_file(file, true).unwrap();
-        let exported = replace.export_rules_file().unwrap();
+    #[test]
+    fn the_configuration_in_use_follows_its_file_both_ways() {
+        // Arrange: the database's groups become the default configuration the first time.
+        let dir = tempfile::tempdir().unwrap();
+        let m = monitor_with_rules(dir.path());
+        let file = profiles::path_of(dir.path(), profiles::DEFAULT);
+        let names = |m: &Monitor| m.host_groups().unwrap().into_iter().map(|g| g.name).collect::<Vec<_>>();
+        let migrated = std::fs::read_to_string(&file).unwrap();
+
+        // Act: a change in the app, then the file edited outside it, then broken.
+        m.create_group("B", "").unwrap();
+        let written = std::fs::read_to_string(&file).unwrap();
+        let edited = "# 手改的配置\ngroups:\n  - name: A\n    entries: [a.com, 'DOMAIN,www.a.com']\n  - name: C\n    entries: [c.com]\nattribution:\n  - name: NAS\n    inbound: Port-2\n";
+        std::fs::write(&file, edited).unwrap();
+        let synced = m.sync_profile().unwrap();
+        let again = m.sync_profile().unwrap();
+        std::fs::write(&file, "groups: [").unwrap();
+        let broken = m.sync_profile().unwrap();
 
         // Assert
+        assert!(migrated.contains("DOMAIN-SUFFIX,a.com") && migrated.contains("Port-1"));
+        assert!(written.contains("name: \"B\""));
+        let plan = synced.changed.unwrap();
         let groups = plan.groups.unwrap();
         assert_eq!((groups.added, groups.changed, groups.removed), (vec!["C".to_string()], vec!["A".to_string()], vec!["B".to_string()]));
-        let rules = plan.attribution.unwrap();
-        assert_eq!((rules.added, rules.changed), (vec!["NAS（Port-2）".to_string()], vec!["容器 1（Port-1）".to_string()]));
-        assert_eq!(names(&replace), [("C".to_string(), 1), ("A".to_string(), 2)]);
-        assert_eq!(names(&merge), [("A".to_string(), 2), ("B".to_string(), 1), ("C".to_string(), 1)]);
-        assert!(merged.groups.unwrap().removed.is_empty());
-        assert_eq!(merge.attribution_rules().unwrap().iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["容器 1", "NAS"]);
-        assert_eq!(replace.plan_rules_file(&exported, false).unwrap().groups.unwrap().unchanged, 2);
-        assert!(
-            replace.attributor().unwrap().process_of(&crate::domain::split::Conn {
-                id: "1".into(),
-                bytes: Bytes::ZERO,
-                chains: vec![],
-                provider_chains: vec![],
-                process: String::new(),
-                inbound: "Port-2".into(),
-                host: String::new(),
-            }) == "NAS"
-        );
+        assert_eq!(plan.attribution.unwrap().added, vec!["NAS（Port-2）".to_string()]);
+        assert_eq!((synced.groups, synced.rules), (2, 1));
+        assert!(again.changed.is_none(), "an unchanged file is not read again");
+        assert!(broken.error.is_some());
+        assert_eq!(names(&m), ["A", "C"], "a file that cannot be read leaves the groups as they were");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "groups: [", "reading never writes the file back");
+    }
+
+    #[test]
+    fn configurations_are_switched_created_imported_and_deleted() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let m = monitor_with_rules(dir.path());
+        let names = |m: &Monitor| m.host_groups().unwrap().into_iter().map(|g| g.name).collect::<Vec<_>>();
+
+        // Act
+        m.create_profile("工作", false).unwrap();
+        m.switch_profile("工作").unwrap();
+        let empty = (names(&m), m.attribution_rules().unwrap().len());
+        m.create_group("X", "").unwrap();
+        m.create_profile("副本", true).unwrap();
+        m.switch_profile(profiles::DEFAULT).unwrap();
+        let back = names(&m);
+        let in_use = m.delete_profile(profiles::DEFAULT);
+        let unreadable = m.import_profile("坏的", "groups: [");
+        let imported = m.import_profile("导入", "groups:\n  - name: Y\n");
+        let taken = m.create_profile("工作", false);
+        m.delete_profile("工作").unwrap();
+        let listed: Vec<(String, bool, usize)> = m.profiles().unwrap().into_iter().map(|p| (p.name, p.active, p.groups)).collect();
+
+        // Assert
+        assert_eq!(empty, (Vec::<String>::new(), 0));
+        assert_eq!(back, ["A"]);
+        assert!(in_use.is_err() && unreadable.is_err() && taken.is_err());
+        assert_eq!(imported.unwrap(), "导入");
+        assert_eq!(listed, [("Default".to_string(), true, 1), ("副本".to_string(), false, 1), ("导入".to_string(), false, 1)]);
     }
 
     #[test]

@@ -274,7 +274,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
     } catch (e) {
       setError(errorText(e));
     }
-  }, [tab, from, to, source, view]);
+  }, [tab, from, to, source, view, route]);
 
   // New choices start over; coming back to the page keeps what it showed while reading again.
   useEffect(() => {

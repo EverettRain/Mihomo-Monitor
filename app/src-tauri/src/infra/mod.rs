@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod import;
 pub mod mihomo;
 pub mod paths;
+pub mod profiles;
 pub mod releases;
 pub mod rules_file;
 pub mod settings;

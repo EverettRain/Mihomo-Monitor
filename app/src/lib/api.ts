@@ -160,11 +160,31 @@ export interface PartPlan {
   unchanged: number;
 }
 
-/** What importing a rules file changes; a part the file leaves out is null and stays as it is. */
+/** What reading a configuration file changed; a part the file leaves out is null and stays as it is. */
 export interface RulesPlan {
   groups: PartPlan | null;
   attribution: PartPlan | null;
   problems: ImportProblem[];
+}
+
+/** The rule configuration in use: a YAML file holding the host groups and attribution rules. */
+export interface RulesProfile {
+  name: string;
+  path: string;
+  groups: number;
+  rules: number;
+  /** What reading its file again changed, when it was edited outside the app. */
+  changed: RulesPlan | null;
+  /** Why its file could not be read; the groups and rules stay as they were. */
+  error: string | null;
+}
+
+export interface RulesProfileSummary {
+  name: string;
+  active: boolean;
+  groups: number;
+  rules: number;
+  error: string | null;
 }
 
 export interface ImportPreview {
@@ -294,10 +314,16 @@ export const api = {
   deleteRules: (ids: number[]) => invoke<void>("delete_rules", { ids }),
   importPreview: (text: string, format: ImportFormat) => invoke<ImportPreview>("import_preview", { text, format }),
   importApply: (entries: ImportEntry[], defaultGroup: string) => invoke<Added>("import_apply", { entries, defaultGroup }),
-  /** Host groups and attribution rules as one YAML rules file. */
-  exportRulesFile: () => invoke<string>("export_rules_file"),
-  planRulesFile: (text: string, keepOthers: boolean) => invoke<RulesPlan>("plan_rules_file", { text, keepOthers }),
-  applyRulesFile: (text: string, keepOthers: boolean) => invoke<RulesPlan>("apply_rules_file", { text, keepOthers }),
+  /** The configuration in use, read again when its file was edited outside the app. */
+  rulesProfile: () => invoke<RulesProfile>("rules_profile"),
+  rulesProfiles: () => invoke<RulesProfileSummary[]>("rules_profiles"),
+  switchRulesProfile: (name: string) => invoke<void>("switch_rules_profile", { name }),
+  /** A new configuration, empty or a copy of the one in use; returns its name. */
+  createRulesProfile: (name: string, copy: boolean) => invoke<string>("create_rules_profile", { name, copy }),
+  importRulesProfile: (name: string, text: string) => invoke<string>("import_rules_profile", { name, text }),
+  deleteRulesProfile: (name: string) => invoke<void>("delete_rules_profile", { name }),
+  openRulesProfile: () => invoke<void>("open_rules_profile"),
+  revealRulesProfile: () => invoke<void>("reveal_rules_profile"),
   subscriptions: () => invoke<Subscription[]>("subscriptions"),
   saveCycle: (cycle: CycleConfig) => invoke<number>("save_cycle", { cycle }),
   deleteCycle: (id: number) => invoke<void>("delete_cycle", { id }),
