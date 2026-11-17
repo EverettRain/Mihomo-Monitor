@@ -5,10 +5,11 @@ mod tray;
 mod window;
 
 use crate::infra::{paths, settings, store::Store};
-use crate::service::monitor::{Event, Monitor, FLUSH_EVERY};
+use crate::service::monitor::{Alert, Event, Monitor, FLUSH_EVERY};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_notification::NotificationExt as _;
 
 /// Turns start-at-login on at the first launch: a traffic monitor only counts while it runs.
 /// Development builds leave it alone, so a debug binary never ends up in the login items.
@@ -28,7 +29,8 @@ fn start_background(app: &AppHandle, monitor: Arc<Monitor>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
-            tray::show_today(&app, monitor.today());
+            let cycles = monitor.subscriptions(paths::now_secs()).unwrap_or_default();
+            tray::show_status(&app, monitor.today(), &cycles);
             tokio::time::sleep(FLUSH_EVERY).await;
         }
     });
@@ -44,6 +46,22 @@ fn sink(app: AppHandle) -> impl Fn(Event) + Send + Sync + 'static {
         Event::SourcesChanged => {
             let _ = app.emit("sources-changed", ());
         }
+        Event::Alert(a) => notify(&app, &a),
+    }
+}
+
+fn notify(app: &AppHandle, a: &Alert) {
+    let resets = jiff::Timestamp::from_second(a.resets_at)
+        .map(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%-m 月 %-d 日 %H:%M").to_string())
+        .unwrap_or_default();
+    let title = if a.threshold >= 100 {
+        format!("{} 本周期流量已用完", a.subscription)
+    } else {
+        format!("{} 本周期已用 {}%", a.subscription, a.threshold)
+    };
+    let body = format!("已用 {}，配额 {}，{resets} 重置。", tray::human(a.used), tray::human(a.quota));
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        paths::log(&format!("无法发送通知：{e}"));
     }
 }
 
@@ -61,6 +79,7 @@ pub fn run(start_in_tray: bool) {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(window::on_event)
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -80,6 +99,9 @@ pub fn run(start_in_tray: bool) {
             commands::data_bounds,
             commands::top_days,
             commands::export_csv,
+            commands::subscriptions,
+            commands::save_cycle,
+            commands::delete_cycle,
             commands::release_notes,
             commands::open_release_page,
             commands::open_data_dir,

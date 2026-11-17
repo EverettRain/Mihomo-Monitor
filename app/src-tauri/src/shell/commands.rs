@@ -7,7 +7,8 @@ use crate::infra::discovery::controller_url;
 use crate::infra::paths;
 use crate::infra::releases::{self, ReleaseNote};
 use crate::infra::settings::{self, ManualSource};
-use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView};
+use crate::infra::store::CycleRow;
+use crate::service::monitor::{Bounds, LivePoint, Monitor, Overview, PeriodRow, RankRow, SourceView, SubscriptionView};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -141,6 +142,21 @@ pub fn hosts(
     merge: bool,
 ) -> Result<Vec<RankRow>, String> {
     monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), merge, 100)
+}
+
+#[tauri::command]
+pub fn subscriptions(monitor: Mon) -> Result<Vec<SubscriptionView>, String> {
+    monitor.subscriptions(paths::now_secs())
+}
+
+#[tauri::command]
+pub fn save_cycle(monitor: Mon, cycle: CycleRow) -> Result<i64, String> {
+    monitor.save_cycle(cycle)
+}
+
+#[tauri::command]
+pub fn delete_cycle(monitor: Mon, id: i64) -> Result<(), String> {
+    monitor.delete_cycle(id)
 }
 
 #[tauri::command]

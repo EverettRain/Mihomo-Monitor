@@ -81,6 +81,52 @@ export interface RankRow extends Bytes {
   key: string;
 }
 
+/** When a billing cycle starts over (local time, quarter hours). */
+export type Reset =
+  | { kind: "monthly"; day: number; hour: number; minute: number }
+  | { kind: "everyDays"; start: string; hour: number; minute: number; days: number };
+
+export type CountMode = "both" | "downloadOnly";
+
+export interface CycleConfig {
+  id: number | null;
+  subscription: string;
+  reset: Reset;
+  /** Bytes per cycle; null for none. */
+  quota: number | null;
+  mode: CountMode;
+  /** Percent of the quota to notify at. */
+  alerts: number[];
+}
+
+export interface CycleView extends CycleConfig {
+  /** Unix seconds. */
+  start: number;
+  end: number;
+  used: number;
+  bytes: Bytes;
+  projected: number | null;
+}
+
+/** What the provider itself reports (all devices on the subscription). */
+export interface Reported {
+  upload: number;
+  download: number;
+  /** 0 when the provider gives no allowance. */
+  total: number;
+  /** Unix seconds. */
+  expire: number | null;
+  updated: number | null;
+}
+
+export interface Subscription {
+  name: string;
+  cycle: CycleView | null;
+  reported: Reported | null;
+  /** This calendar month. */
+  month: Bytes;
+}
+
 export interface ManualSource {
   name: string;
   url: string;
@@ -124,6 +170,9 @@ export const api = {
   ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
   hosts: (from: string, to: string, source: number | null, process: string | null, merge: boolean) =>
     invoke<RankRow[]>("hosts", { from, to, source, process, merge }),
+  subscriptions: () => invoke<Subscription[]>("subscriptions"),
+  saveCycle: (cycle: CycleConfig) => invoke<number>("save_cycle", { cycle }),
+  deleteCycle: (id: number) => invoke<void>("delete_cycle", { id }),
   dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
   topDays: (source: number | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, limit }),
   /** Opens a save dialog; false when the user cancelled it. */

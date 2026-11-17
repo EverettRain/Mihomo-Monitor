@@ -6,13 +6,14 @@
 //! empty outbound key. Schema changes go through `migrate`, keyed by `PRAGMA user_version`.
 
 use crate::domain::counter::{Bytes, Checkpoint, CoreId};
+use crate::domain::cycle::{CountMode, Reset};
 use crate::domain::period::Range;
 use crate::domain::split::DimKind;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -68,6 +69,26 @@ CREATE TABLE meta (
     value TEXT NOT NULL
 );
 ";
+
+/// One billing cycle per subscription.
+const SCHEMA_V3: &str = "
+CREATE UNIQUE INDEX cycles_subscription ON cycles (subscription);
+";
+
+/// A subscription's billing cycle as configured.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CycleRow {
+    /// `None` for one not saved yet.
+    pub id: Option<i64>,
+    pub subscription: String,
+    pub reset: Reset,
+    /// Allowance per cycle in bytes, when there is one.
+    pub quota: Option<u64>,
+    pub mode: CountMode,
+    /// Percentages of the quota to notify at.
+    pub alerts: Vec<u8>,
+}
 
 /// Dimension kind of hosts in `domain_daily` (not a traffic dimension).
 const HOST: &str = "domain";
@@ -378,6 +399,68 @@ impl Store {
         let rows = stmt.query_map(params![range.start, range.end, source], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
+    pub fn cycles(&self) -> Result<Vec<CycleRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, subscription, anchor, quota_bytes, count_mode, alerts FROM cycles ORDER BY subscription")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, subscription, reset, quota, mode, alerts) = row.map_err(err)?;
+            // A row this version cannot read (written by a newer one) is skipped, not fatal.
+            let (Ok(reset), Ok(mode), Ok(alerts)) =
+                (serde_json::from_str(&reset), serde_json::from_value(serde_json::Value::String(mode)), serde_json::from_str(&alerts))
+            else {
+                continue;
+            };
+            out.push(CycleRow { id: Some(id), subscription, reset, quota: quota.map(|q| q.max(0) as u64), mode, alerts });
+        }
+        Ok(out)
+    }
+
+    /// Saves a subscription's cycle, replacing the one it had; returns its id.
+    pub fn save_cycle(&self, c: &CycleRow) -> Result<i64, String> {
+        let reset = serde_json::to_string(&c.reset).map_err(|e| e.to_string())?;
+        let mode = match serde_json::to_value(c.mode).map_err(|e| e.to_string())? {
+            serde_json::Value::String(m) => m,
+            _ => return Err("计量方式无效。".into()),
+        };
+        let alerts = serde_json::to_string(&c.alerts).map_err(|e| e.to_string())?;
+        self.conn
+            .query_row(
+                "INSERT INTO cycles (subscription, anchor, quota_bytes, count_mode, alerts) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (subscription) DO UPDATE SET anchor = excluded.anchor, quota_bytes = excluded.quota_bytes,
+                     count_mode = excluded.count_mode, alerts = excluded.alerts
+                 RETURNING id",
+                params![c.subscription, reset, c.quota.map(int), mode, alerts],
+                |r| r.get(0),
+            )
+            .map_err(err)
+    }
+
+    pub fn delete_cycle(&self, id: i64) -> Result<(), String> {
+        self.conn.execute("DELETE FROM cycles WHERE id = ?1", [id]).map(|_| ()).map_err(err)
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(err)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", params![key, value]).map(|_| ()).map_err(err)
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {
@@ -390,6 +473,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     }
     if version < 2 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;")).map_err(err)?;
+    }
+    if version < 3 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;")).map_err(err)?;
     }
     Ok(())
 }
@@ -534,6 +620,33 @@ mod tests {
             ]
         );
         assert_eq!(day("2026-11-16").len(), 1);
+    }
+
+    #[test]
+    fn a_subscription_has_one_cycle_which_saving_replaces() {
+        // Arrange
+        let store = Store::open_in_memory();
+        let mut c = CycleRow {
+            id: None,
+            subscription: "白月光".into(),
+            reset: Reset::Monthly { day: 15, hour: 0, minute: 0 },
+            quota: Some(200 << 30),
+            mode: CountMode::Both,
+            alerts: vec![80, 100],
+        };
+
+        // Act
+        let id = store.save_cycle(&c).unwrap();
+        c.mode = CountMode::DownloadOnly;
+        c.quota = None;
+        let again = store.save_cycle(&c).unwrap();
+        let saved = store.cycles().unwrap();
+        store.delete_cycle(id).unwrap();
+
+        // Assert
+        assert_eq!(id, again);
+        assert_eq!(saved, vec![CycleRow { id: Some(id), ..c }]);
+        assert!(store.cycles().unwrap().is_empty());
     }
 
     #[test]

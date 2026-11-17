@@ -6,10 +6,11 @@
 
 use super::discover::{self, Discovery, Found};
 use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
+use crate::domain::cycle::{self, Reported};
 use crate::domain::period::{self, bucket_of, Period, Range};
 use crate::domain::split::{self, DimKind, Dims, Tracker};
 use crate::infra::mihomo::Client;
-use crate::infra::store::{BucketDelta, HostDelta, Store};
+use crate::infra::store::{BucketDelta, CycleRow, HostDelta, Store};
 use crate::infra::{discovery, paths, settings, verge};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
@@ -29,6 +30,11 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 /// A finished day keeps this many (process, host) pairs, and each process its own biggest few.
 const HOSTS_KEPT: usize = 200;
 const HOSTS_PER_PROCESS: usize = 10;
+/// How often providers' usage reports are fetched from a core; they change only when the client
+/// refreshes the subscription.
+const REPORTS_EVERY: Duration = Duration::from_secs(10 * 60);
+/// Subscriptions with traffic within this many days are listed even without a cycle.
+const SUBSCRIPTIONS_SEEN_DAYS: i64 = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +72,45 @@ pub enum Event {
     Sample(LivePoint),
     /// The list of sources or their state changed.
     SourcesChanged,
+    /// A subscription's use in its cycle reached one of its alert thresholds.
+    Alert(Alert),
+}
+
+pub struct Alert {
+    pub subscription: String,
+    /// Percent of the quota reached.
+    pub threshold: u8,
+    pub used: u64,
+    pub quota: u64,
+    /// When the cycle resets, unix seconds.
+    pub resets_at: i64,
+}
+
+/// A subscription's current cycle and its use so far.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CycleView {
+    #[serde(flatten)]
+    pub config: CycleRow,
+    /// Unix seconds.
+    pub start: i64,
+    pub end: i64,
+    /// Counted the configured way (both directions or download only).
+    pub used: u64,
+    pub bytes: Bytes,
+    /// Use at the end of the cycle at the pace so far.
+    pub projected: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionView {
+    pub name: String,
+    pub cycle: Option<CycleView>,
+    /// The provider's own report, when the client or core has one.
+    pub reported: Option<Reported>,
+    /// This calendar month, for subscriptions without a cycle.
+    pub month: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -227,6 +272,8 @@ struct State {
     /// collectors stop at the next reading.
     stopping: HashSet<String>,
     live: HashMap<i64, VecDeque<LivePoint>>,
+    /// Latest usage report per subscription name.
+    reported: HashMap<String, Reported>,
 }
 
 pub struct Monitor {
@@ -287,6 +334,9 @@ impl Monitor {
             tokio::time::sleep(FLUSH_EVERY).await;
             if let Err(e) = self.flush() {
                 paths::log(&format!("写入数据库失败：{e}"));
+            }
+            if let Err(e) = self.check_alerts(paths::now_secs()) {
+                paths::log(&format!("检查流量提醒失败：{e}"));
             }
         }
     }
@@ -397,13 +447,25 @@ impl Monitor {
     async fn read_connections(&self, client: &Client, f: &Found, id: i64) -> Result<(), String> {
         let mut prev: Option<Bytes> = None;
         let mut tracker = Tracker::default();
-        let mut profile = (f.key == discovery::VERGE_KEY).then(verge::ActiveProfile::default);
+        let mut profiles = (f.key == discovery::VERGE_KEY).then(verge::Profiles::default);
         let mut tick = tokio::time::interval(POLL_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut reports_due = tokio::time::Instant::now();
         loop {
             tick.tick().await;
             let snap = client.connections().await.map_err(|e| e.to_string())?;
-            let subscription = profile.as_mut().and_then(|p| p.get().map(str::to_string));
+            if tokio::time::Instant::now() >= reports_due {
+                reports_due += REPORTS_EVERY;
+                // A core without providers, or an older one, simply has nothing to report.
+                if let Ok(list) = client.providers().await {
+                    self.note_reports(list);
+                }
+            }
+            let subscription = profiles.as_mut().and_then(|p| {
+                p.refresh();
+                self.note_reports(p.reported().to_vec());
+                p.active().map(str::to_string)
+            });
             let deltas: Vec<(Dims, Bytes)> =
                 tracker.step(&snap.conns).into_iter().map(|(c, b)| (split::dims_of(c, subscription.as_deref()), b)).collect();
             if !self.account(&f.key, id, f.core.as_ref(), prev, snap.totals, &deltas, paths::now_secs()) {
@@ -455,6 +517,13 @@ impl Monitor {
         st.checkpoints.insert(id, Checkpoint { core: core.cloned(), totals, at: now });
         st.dirty.insert(id);
         true
+    }
+
+    fn note_reports(&self, list: Vec<(String, Reported)>) {
+        let mut st = lock(&self.state);
+        for (name, r) in list {
+            st.reported.insert(name, r);
+        }
     }
 
     /// Keeps a per-second rate for the live chart; `None` when the source is no longer wanted.
@@ -712,6 +781,18 @@ impl Monitor {
     /// per-connection collection began); the rest is listed under the empty key.
     pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
+        let mut map = self.kind_sums(kind, range, source)?;
+        if kind != DimKind::Outbound {
+            let total = Prefix::new(self.buckets(range, source)?).sum(range);
+            let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
+            let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
+            *map.entry(String::new()).or_default() += rest;
+        }
+        Ok(ranked(map))
+    }
+
+    /// Traffic per key of one dimension in `range`, written and pending.
+    fn kind_sums(&self, kind: DimKind, range: Range, source: Option<i64>) -> Result<HashMap<String, Bytes>, String> {
         let mut map: HashMap<String, Bytes> = HashMap::new();
         for (key, b) in lock(&self.store).ranking(kind, range, source)? {
             *map.entry(key).or_default() += b;
@@ -721,13 +802,92 @@ impl Monitor {
                 *map.entry(key.clone()).or_default() += *b;
             }
         }
-        if kind != DimKind::Outbound {
-            let total = Prefix::new(self.buckets(range, source)?).sum(range);
-            let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
-            let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
-            *map.entry(String::new()).or_default() += rest;
+        Ok(map)
+    }
+
+    /// Every subscription known — seen in traffic, reported by a client or core, or given a
+    /// cycle — with its current cycle, the provider's report and this month's use. Subscriptions
+    /// with a cycle come first, then by this month's use.
+    pub fn subscriptions(&self, now: i64) -> Result<Vec<SubscriptionView>, String> {
+        let tz = TimeZone::system();
+        let zoned = jiff::Timestamp::from_second(now).map_err(|e| e.to_string())?.to_zoned_datetime(tz.clone());
+        let month = period::current(Period::Month, &zoned, Weekday::Monday).map_err(|e| e.to_string())?;
+        let seen = Range { start: now - SUBSCRIPTIONS_SEEN_DAYS * 86_400, end: now + 1 };
+        let month_use = self.kind_sums(DimKind::Subscription, month, None)?;
+        let cycles = lock(&self.store).cycles()?;
+        let reported = lock(&self.state).reported.clone();
+
+        let mut names: Vec<String> = self.kind_sums(DimKind::Subscription, seen, None)?.into_keys().collect();
+        names.extend(reported.keys().cloned());
+        names.extend(cycles.iter().map(|c| c.subscription.clone()));
+        names.retain(|n| !n.is_empty() && n != split::DIRECT);
+        names.sort();
+        names.dedup();
+
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let cycle = match cycles.iter().find(|c| c.subscription == name) {
+                Some(c) => Some(self.cycle_view(c, now, &tz)?),
+                None => None,
+            };
+            out.push(SubscriptionView {
+                cycle,
+                reported: reported.get(&name).copied(),
+                month: month_use.get(&name).copied().unwrap_or_default(),
+                name,
+            });
         }
-        Ok(ranked(map))
+        out.sort_by(|a, b| {
+            b.cycle
+                .is_some()
+                .cmp(&a.cycle.is_some())
+                .then((b.month.up + b.month.down).cmp(&(a.month.up + a.month.down)))
+                .then(a.name.cmp(&b.name))
+        });
+        Ok(out)
+    }
+
+    fn cycle_view(&self, c: &CycleRow, now: i64, tz: &TimeZone) -> Result<CycleView, String> {
+        let range = cycle::current_at(&c.reset, now, tz)?;
+        let bytes = self.kind_sums(DimKind::Subscription, range, None)?.get(&c.subscription).copied().unwrap_or_default();
+        let used = c.mode.used(bytes);
+        Ok(CycleView { config: c.clone(), start: range.start, end: range.end, used, bytes, projected: cycle::projected(used, range, now) })
+    }
+
+    pub fn save_cycle(&self, mut c: CycleRow) -> Result<i64, String> {
+        c.subscription = c.subscription.trim().to_string();
+        if c.subscription.is_empty() || c.subscription == split::DIRECT {
+            return Err("请选择一个订阅。".into());
+        }
+        c.reset.check()?;
+        c.alerts.retain(|a| (1..=200).contains(a));
+        c.alerts.sort_unstable();
+        c.alerts.dedup();
+        if c.quota == Some(0) {
+            c.quota = None;
+        }
+        lock(&self.store).save_cycle(&c)
+    }
+
+    pub fn delete_cycle(&self, id: i64) -> Result<(), String> {
+        lock(&self.store).delete_cycle(id)
+    }
+
+    /// Notifies each threshold a cycle newly reached, once per cycle.
+    pub fn check_alerts(&self, now: i64) -> Result<(), String> {
+        let tz = TimeZone::system();
+        let cycles = lock(&self.store).cycles()?;
+        for c in cycles.iter().filter(|c| c.quota.is_some_and(|q| q > 0) && !c.alerts.is_empty()) {
+            let (Some(id), Some(quota)) = (c.id, c.quota) else { continue };
+            let v = self.cycle_view(c, now, &tz)?;
+            let key = format!("alerted:{id}:{}", v.start);
+            let already = lock(&self.store).meta(&key)?.and_then(|s| s.parse().ok()).unwrap_or(0);
+            if let Some(threshold) = cycle::crossed(v.used, quota, &c.alerts, already) {
+                lock(&self.store).set_meta(&key, &threshold.to_string())?;
+                (self.sink)(Event::Alert(Alert { subscription: c.subscription.clone(), threshold, used: v.used, quota, resets_at: v.end }));
+            }
+        }
+        Ok(())
     }
 
     /// Hosts over the local days `from` through `to`, of one process or of all, biggest first;
@@ -951,6 +1111,78 @@ mod tests {
         assert_eq!(after, outbound);
         assert_eq!(chrome.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("www.youtube.com", 600), ("i.ytimg.com", 100)]);
         assert_eq!(merged.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("youtube.com", 600), ("", 300)]);
+    }
+
+    #[test]
+    fn a_cycle_counts_its_subscription_and_alerts_once_per_threshold() {
+        // Arrange: a cycle with a 1000-byte quota and 600 bytes used through it so far.
+        let alerts = Arc::new(Mutex::new(Vec::new()));
+        let seen = alerts.clone();
+        let store = Store::open_in_memory();
+        let id = store.ensure_source("a", "A", 0).unwrap();
+        let m = Monitor::new(store, move |e| {
+            if let Event::Alert(a) = e {
+                seen.lock().unwrap().push((a.subscription, a.threshold, a.used));
+            }
+        });
+        let now = noon().timestamp().as_second();
+        let dims = |sub: &str| Dims {
+            outbound: "HK".into(),
+            subscription: sub.into(),
+            process: String::new(),
+            inbound: String::new(),
+            host: "x.com".into(),
+        };
+        m.account("a", id, None, None, Bytes::ZERO, &[], now - 60);
+        m.account(
+            "a",
+            id,
+            None,
+            Some(Bytes::ZERO),
+            Bytes::new(100, 600),
+            &[(dims("白月光"), Bytes::new(100, 500)), (dims("其他"), Bytes::new(0, 100))],
+            now - 30,
+        );
+        let cycle = CycleRow {
+            id: None,
+            subscription: "白月光".into(),
+            reset: cycle::Reset::EveryDays { start: "2026-01-01".into(), hour: 0, minute: 0, days: 365 },
+            quota: Some(1_000),
+            mode: cycle::CountMode::Both,
+            alerts: vec![100, 50, 80, 50],
+        };
+
+        // Act
+        m.save_cycle(cycle).unwrap();
+        let subs = m.subscriptions(now).unwrap();
+        m.check_alerts(now).unwrap();
+        m.check_alerts(now).unwrap();
+
+        // Assert
+        let c = subs[0].cycle.as_ref().unwrap();
+        assert_eq!((subs[0].name.as_str(), c.used, c.config.alerts.clone()), ("白月光", 600, vec![50, 80, 100]));
+        assert_eq!(subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["白月光", "其他"]);
+        assert_eq!(*alerts.lock().unwrap(), vec![("白月光".to_string(), 50, 600)]);
+    }
+
+    #[test]
+    fn direct_traffic_cannot_have_a_cycle() {
+        // Arrange
+        let (m, _) = monitor_with_source();
+        let c = CycleRow {
+            id: None,
+            subscription: split::DIRECT.into(),
+            reset: cycle::Reset::Monthly { day: 1, hour: 0, minute: 0 },
+            quota: None,
+            mode: cycle::CountMode::Both,
+            alerts: vec![],
+        };
+
+        // Act
+        let result = m.save_cycle(c);
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[test]

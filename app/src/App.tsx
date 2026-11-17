@@ -9,6 +9,7 @@ import { HistoryPage } from "@/pages/HistoryPage";
 import { OverviewPage } from "@/pages/OverviewPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { SourcesPage } from "@/pages/SourcesPage";
+import { SubscriptionsPage } from "@/pages/SubscriptionsPage";
 
 export default function App() {
   const [page, setPage] = useState<PageId>("overview");
@@ -35,9 +36,10 @@ export default function App() {
 
   return (
     <AppShell activePage={page} onPageChange={setPage} theme={theme} onThemeChange={setTheme} status={status}>
-      {page === "overview" && <OverviewPage sources={sources} onOpenSources={() => setPage("sources")} />}
+      {page === "overview" && <OverviewPage sources={sources} onOpenSources={() => setPage("sources")} onOpenSubscriptions={() => setPage("subscriptions")} />}
       {page === "history" && <HistoryPage sources={sources} />}
       {page === "breakdown" && <BreakdownPage sources={sources} />}
+      {page === "subscriptions" && <SubscriptionsPage />}
       {page === "sources" && <SourcesPage sources={sources} />}
       {page === "settings" && <SettingsPage info={info} />}
       {page === "about" && <AboutPage info={info} />}

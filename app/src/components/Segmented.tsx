@@ -13,7 +13,7 @@ export function Segmented<T extends string | number>({
   label: string;
 }) {
   return (
-    <div role="radiogroup" aria-label={label} className="flex min-w-0 flex-wrap gap-0.5 rounded-lg bg-pill p-0.5">
+    <div role="radiogroup" aria-label={label} className="inline-flex min-w-0 max-w-full flex-wrap gap-0.5 rounded-lg bg-pill p-0.5">
       {options.map(([v, text]) => (
         <button
           key={String(v)}

@@ -8,8 +8,9 @@ import { Group, Page, PageHeader } from "@/components/PageHeader";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
-import { api, errorText, type Bytes, type DayPoint, type LivePoint, type Overview, type Source } from "@/lib/api";
-import { bytes, bytesShort, rate } from "@/lib/utils";
+import { api, errorText, type Bytes, type DayPoint, type LivePoint, type Overview, type Source, type Subscription } from "@/lib/api";
+import { meterTone, percentUsed, remaining } from "@/lib/cycle";
+import { bytes, bytesShort, cn, rate } from "@/lib/utils";
 
 /** Seconds shown in the live chart. */
 const LIVE_WINDOW = 300;
@@ -97,9 +98,50 @@ function useLive(source: number | null) {
 
 const STATUS_TAG = { online: ["正在统计", "ok"], connecting: ["正在连接", "warn"], offline: ["未连接", undefined] } as const;
 
-export function OverviewPage({ sources, onOpenSources }: { sources: Source[] | null; onOpenSources: () => void }) {
+/** Each subscription's billing cycle at a glance, as Hydra shows an account's limits. */
+function Cycles({ subs, onOpen }: { subs: Subscription[]; onOpen: () => void }) {
+  const now = Math.floor(Date.now() / 1000);
+  const withCycle = subs.filter((s) => s.cycle);
+  if (!withCycle.length) return null;
+  return (
+    <Group label="计费周期">
+      {withCycle.map((s) => {
+        const c = s.cycle!;
+        const pct = percentUsed(c);
+        return (
+          <button key={s.name} onClick={onOpen} className="block w-full px-4 py-3 text-left hover:bg-pill/50 active:!scale-100">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="truncate text-[13px] font-medium">{s.name}</span>
+              <span className="shrink-0 font-mono text-[12px] tabular-nums">
+                {bytes(c.used)}
+                {c.quota ? <span className="text-muted"> / {bytes(c.quota)}</span> : null}
+              </span>
+            </div>
+            <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-pill">
+              <div className={cn("h-full rounded-full", meterTone(pct))} style={{ width: `${pct === null ? 0 : Math.min(100, Math.max(pct, 1))}%` }} />
+            </div>
+            <div className="mt-1 text-[10.5px] text-muted">
+              {[`还剩 ${remaining(c.end, now)}`, pct === null ? "" : `${pct.toFixed(0)}%`, c.projected === null ? "" : `预计周期末 ${bytes(c.projected)}`].filter(Boolean).join(" · ")}
+            </div>
+          </button>
+        );
+      })}
+    </Group>
+  );
+}
+
+export function OverviewPage({
+  sources,
+  onOpenSources,
+  onOpenSubscriptions,
+}: {
+  sources: Source[] | null;
+  onOpenSources: () => void;
+  onOpenSubscriptions: () => void;
+}) {
   const [source, setSource] = useState<number | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [subs, setSubs] = useState<Subscription[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"overview" | "trend">("overview");
   const [range, setRange] = useState<RangeId>("today");
@@ -116,6 +158,7 @@ export function OverviewPage({ sources, onOpenSources }: { sources: Source[] | n
   const load = useCallback(async () => {
     try {
       setOverview(await api.overview(source));
+      setSubs(await api.subscriptions());
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -273,6 +316,8 @@ export function OverviewPage({ sources, onOpenSources }: { sources: Source[] | n
             </div>
           )}
         </section>
+
+        <Cycles subs={subs} onOpen={onOpenSubscriptions} />
 
         {recorded.length > 0 && (
           <Group label="内核">

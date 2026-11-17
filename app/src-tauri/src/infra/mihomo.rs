@@ -3,6 +3,7 @@
 //! `hub/route/server.go`); their file permissions are the access control.
 
 use crate::domain::counter::Bytes;
+use crate::domain::cycle::Reported;
 use crate::domain::split::Conn;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -132,6 +133,13 @@ impl Client {
         parse_snapshot(&body).ok_or_else(|| ApiError::Unexpected("连接列表格式无法识别".into()))
     }
 
+    /// Usage reports of the core's proxy-providers that have one (fetched from the provider's
+    /// `subscription-userinfo` header), by provider name.
+    pub async fn providers(&self) -> Result<Vec<(String, Reported)>, ApiError> {
+        let body = self.get("/providers/proxies").await?.bytes().await.map_err(unreachable)?;
+        parse_providers(&body).ok_or_else(|| ApiError::Unexpected("订阅信息格式无法识别".into()))
+    }
+
     pub async fn traffic(&self) -> Result<TrafficStream, ApiError> {
         Ok(TrafficStream { resp: self.get("/traffic").await?, buf: Vec::new() })
     }
@@ -227,6 +235,55 @@ pub fn parse_snapshot(body: &[u8]) -> Option<Snapshot> {
     })
 }
 
+/// Parses a `/providers/proxies` body into the providers' usage reports.
+pub fn parse_providers(body: &[u8]) -> Option<Vec<(String, Reported)>> {
+    #[derive(Deserialize)]
+    struct Body {
+        providers: std::collections::HashMap<String, Provider>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Provider {
+        #[serde(default)]
+        subscription_info: Option<Info>,
+        #[serde(default)]
+        updated_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Info {
+        #[serde(default)]
+        upload: i64,
+        #[serde(default)]
+        download: i64,
+        #[serde(default)]
+        total: i64,
+        #[serde(default)]
+        expire: i64,
+    }
+    let b: Body = serde_json::from_slice(body).ok()?;
+    let mut out: Vec<(String, Reported)> = b
+        .providers
+        .into_iter()
+        .filter_map(|(name, p)| {
+            let i = p.subscription_info?;
+            let updated = p.updated_at.and_then(|t| t.parse::<jiff::Timestamp>().ok()).map(|t| t.as_second());
+            Some((
+                name,
+                Reported {
+                    upload: i.upload.max(0) as u64,
+                    download: i.download.max(0) as u64,
+                    total: i.total.max(0) as u64,
+                    expire: (i.expire > 0).then_some(i.expire),
+                    updated,
+                },
+            ))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
 /// Parses one `/traffic` line; blank or foreign lines give `None`.
 pub fn parse_sample(line: &[u8]) -> Option<Sample> {
     #[derive(Deserialize)]
@@ -280,6 +337,23 @@ mod tests {
         assert_eq!(s.conns[0].chains, ["HK 01", "Proxy"]);
         assert_eq!(s.conns[1].host, "1.1.1.1");
         assert!(s.conns[1].provider_chains.is_empty());
+    }
+
+    #[test]
+    fn reads_the_providers_usage_reports() {
+        // Arrange: providers without a subscription (rule sets, inline proxies) have no info.
+        let body = r#"{"providers":{
+            "default":{"name":"default","type":"Proxy","vehicleType":"Compatible","proxies":[]},
+            "机场A":{"name":"机场A","type":"Proxy","vehicleType":"HTTP","proxies":[],"updatedAt":"2026-11-16T08:00:00.000000+08:00",
+                     "subscriptionInfo":{"Upload":10,"Download":20,"Total":300,"Expire":1798000000}}}}"#;
+
+        // Act
+        let got = parse_providers(body.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "机场A");
+        assert_eq!(got[0].1, Reported { upload: 10, download: 20, total: 300, expire: Some(1798000000), updated: Some(1794787200) });
     }
 
     #[test]

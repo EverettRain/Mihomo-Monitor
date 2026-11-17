@@ -3,6 +3,7 @@
 use super::window::show_main;
 use crate::domain::counter::Bytes;
 use crate::infra::settings;
+use crate::service::monitor::SubscriptionView;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Wry};
@@ -82,10 +83,18 @@ pub fn refresh_menu(app: &AppHandle) {
     }
 }
 
-pub fn show_today(app: &AppHandle, today: Bytes) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_tooltip(Some(format!("Mihomo-Monitor\n今日  ↑ {}  ↓ {}", human(today.up), human(today.down))));
+/// Today's traffic, and each billing cycle's use so far.
+pub fn show_status(app: &AppHandle, today: Bytes, subscriptions: &[SubscriptionView]) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
+    let mut text = format!("Mihomo-Monitor\n今日  ↑ {}  ↓ {}", human(today.up), human(today.down));
+    for s in subscriptions {
+        let Some(c) = &s.cycle else { continue };
+        match c.config.quota {
+            Some(q) => text.push_str(&format!("\n{}  本周期 {} / {}", s.name, human(c.used), human(q))),
+            None => text.push_str(&format!("\n{}  本周期 {}", s.name, human(c.used))),
+        }
     }
+    let _ = tray.set_tooltip(Some(text));
 }
 
 #[cfg(test)]

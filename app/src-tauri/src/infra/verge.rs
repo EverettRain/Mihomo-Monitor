@@ -1,10 +1,13 @@
-//! Clash Verge Rev's own files: which profile (the subscription, or a local config) is active.
+//! Clash Verge Rev's own files: which profile (the subscription, or a local config) is active,
+//! and what each subscription's provider reported.
 //!
 //! Verge downloads a subscription and expands its nodes into the core's config, so the core
 //! cannot say which subscription a node came from. The active profile can: `profiles.yaml` in
-//! Verge's data folder names it (`current` is the uid of an entry in `items`). Verified with
-//! Verge 2.5.6, also in service mode, where the file stays in the user's own folder.
+//! Verge's data folder names it (`current` is the uid of an entry in `items`), and a remote
+//! profile keeps the provider's usage report in `extra`. Verified with Verge 2.5.6, also in
+//! service mode, where the file stays in the user's own folder.
 
+use crate::domain::cycle::Reported;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -34,22 +37,57 @@ pub fn active_profile(text: &str) -> Option<String> {
     }
 }
 
-/// The active profile, re-read only when `profiles.yaml` changes.
-#[derive(Default)]
-pub struct ActiveProfile {
-    seen: Option<SystemTime>,
-    name: Option<String>,
+/// Each named profile's usage report (`extra`); local profiles have none.
+pub fn reported(text: &str) -> Vec<(String, Reported)> {
+    let Ok(docs) = YamlLoader::load_from_str(text) else { return Vec::new() };
+    let Some(items) = docs.first().and_then(|d| d["items"].as_vec()) else { return Vec::new() };
+    let int = |y: &Yaml| y.as_i64().filter(|v| *v > 0);
+    items
+        .iter()
+        .filter_map(|i| {
+            let name = i["name"].as_str()?.trim();
+            let extra = &i["extra"];
+            if name.is_empty() || extra.is_badvalue() || extra.is_null() {
+                return None;
+            }
+            let r = Reported {
+                upload: int(&extra["upload"]).unwrap_or(0) as u64,
+                download: int(&extra["download"]).unwrap_or(0) as u64,
+                total: int(&extra["total"]).unwrap_or(0) as u64,
+                expire: int(&extra["expire"]),
+                updated: int(&i["updated"]),
+            };
+            Some((name.to_string(), r))
+        })
+        .collect()
 }
 
-impl ActiveProfile {
-    pub fn get(&mut self) -> Option<&str> {
-        let path = profiles_path()?;
+/// `profiles.yaml`, re-read only when it changes.
+#[derive(Default)]
+pub struct Profiles {
+    seen: Option<SystemTime>,
+    active: Option<String>,
+    reported: Vec<(String, Reported)>,
+}
+
+impl Profiles {
+    pub fn refresh(&mut self) {
+        let Some(path) = profiles_path() else { return };
         let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if modified != self.seen {
             self.seen = modified;
-            self.name = std::fs::read_to_string(&path).ok().and_then(|t| active_profile(&t));
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            self.active = active_profile(&text);
+            self.reported = reported(&text);
         }
-        self.name.as_deref()
+    }
+
+    pub fn active(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+
+    pub fn reported(&self) -> &[(String, Reported)] {
+        &self.reported
     }
 }
 
@@ -83,6 +121,48 @@ items:
 
         // Assert
         assert_eq!(name.as_deref(), Some("白月光"));
+    }
+
+    #[test]
+    fn remote_profiles_carry_the_providers_report() {
+        // Arrange
+        let text = "items:
+- uid: a
+  type: local
+  name: VPS
+- uid: b
+  type: remote
+  name: 白月光
+  updated: 1794800000
+  extra:
+    upload: 1073741824
+    download: 10737418240
+    total: 214748364800
+    expire: 1798000000
+- uid: c
+  type: remote
+  name: 不限量
+  extra:
+    upload: 0
+    download: 5
+    total: 0
+    expire: 0
+";
+
+        // Act
+        let got = reported(text);
+
+        // Assert
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "白月光".to_string(),
+                    Reported { upload: 1 << 30, download: 10 << 30, total: 200 << 30, expire: Some(1798000000), updated: Some(1794800000) }
+                ),
+                ("不限量".to_string(), Reported { upload: 0, download: 5, total: 0, expire: None, updated: None }),
+            ]
+        );
     }
 
     #[test]
