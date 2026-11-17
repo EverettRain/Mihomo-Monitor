@@ -43,7 +43,7 @@
     ],
     "category": "Utility",
     "shortDescription": "Mihomo-Monitor",
-    "longDescription": "vnstat-style traffic statistics for the mihomo core you already run.",
+    "longDescription": "Long-term traffic statistics, by hour, day, week, month and year, for the mihomo core you already run.",
     "windows": {
       "nsis": {
         "installMode": "currentUser"

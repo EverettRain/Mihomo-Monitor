@@ -2,7 +2,7 @@
   "name": "mihomo-monitor",
   "version": "1.0.1",
   "private": true,
-  "description": "Mihomo-Monitor - vnstat-style traffic statistics for the mihomo core you already run",
+  "description": "Mihomo-Monitor - long-term traffic statistics for the mihomo core you already run",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "scripts": {

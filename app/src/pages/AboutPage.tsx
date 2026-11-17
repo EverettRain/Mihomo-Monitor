@@ -5,7 +5,7 @@ import type { AppInfo } from "@/lib/api";
 
 const points = [
   { icon: Radar, title: "直接读取已有的内核", text: "自动找到 Clash Verge Rev 等客户端正在运行的 mihomo 内核，只读取流量计数，不接管、不改动代理。" },
-  { icon: CalendarRange, title: "像 vnstat 一样记账", text: "按 15 分钟记录、永久保存，按本地时间汇总成小时、日、周、月、年。" },
+  { icon: CalendarRange, title: "长期记账", text: "按 15 分钟记录、永久保存，按本地时间汇总成小时、日、周、月、年。" },
   { icon: RotateCcw, title: "不漏记", text: "以内核的累计计数为准；Mihomo-Monitor 退出或电脑睡眠期间，只要内核没有重启，流量会在下次读取时补回。" },
   { icon: Feather, title: "常驻托盘，几乎不占资源", text: "后台统计只是一个轻量的 Rust 进程；开启轻量模式时，关闭窗口会连界面一起释放。" },
 ];
