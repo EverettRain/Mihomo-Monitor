@@ -165,7 +165,7 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
     <Page>
       <PageHeader
         title="历史"
-        subtitle="按小时、日、周、月、年翻看任意时段的流量，对应 vnstat 的 -h / -d / -w / -m / -y / -t。"
+        subtitle="按小时、日、周、月、年翻看任意时段的流量。"
         actions={
           <>
             <Segmented label="流量范围" value={route} onChange={setRoute} options={ROUTE_FILTERS} />
