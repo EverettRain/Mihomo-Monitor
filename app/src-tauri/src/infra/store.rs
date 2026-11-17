@@ -5,6 +5,7 @@
 //! a bucket always add up to its total, with traffic that could not be attributed under the
 //! empty outbound key. Schema changes go through `migrate`, keyed by `PRAGMA user_version`.
 
+use crate::domain::attribution::{AttributionRule, Field};
 use crate::domain::counter::{Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{CountMode, Reset};
 use crate::domain::hostgroup::{Rule, RuleKind};
@@ -14,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -90,6 +91,19 @@ CREATE TABLE host_rules (
     kind TEXT NOT NULL,
     value TEXT NOT NULL,
     UNIQUE (group_id, kind, value)
+);
+";
+
+/// Rules that name traffic the core could not tie to a process. They apply as connections are
+/// read; what was recorded before a rule existed or changed stays as it was.
+const SCHEMA_V5: &str = "
+CREATE TABLE attribution_rules (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    enabled INTEGER NOT NULL
 );
 ";
 
@@ -506,6 +520,59 @@ impl Store {
         self.conn.execute("DELETE FROM cycles WHERE id = ?1", [id]).map(|_| ()).map_err(err)
     }
 
+    /// Every attribution rule, in the order they are tried.
+    pub fn attribution_rules(&self) -> Result<Vec<AttributionRule>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, field, value, priority, enabled FROM attribution_rules ORDER BY priority, id")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get(4)?, r.get(5)?))
+            })
+            .map_err(err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, field, value, priority, enabled) = row.map_err(err)?;
+            // A field from a newer version of the app is left alone rather than misread.
+            let Some(field) = Field::parse(&field) else { continue };
+            out.push(AttributionRule { id: Some(id), name, field, value, priority, enabled });
+        }
+        Ok(out)
+    }
+
+    /// Adds a rule, or replaces the one with its id.
+    pub fn save_attribution_rule(&self, r: &AttributionRule) -> Result<i64, String> {
+        let p = params![r.name, r.field.as_str(), r.value, r.priority, r.enabled];
+        match r.id {
+            Some(id) => {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE attribution_rules SET name = ?1, field = ?2, value = ?3, priority = ?4, enabled = ?5 WHERE id = ?6",
+                        params![r.name, r.field.as_str(), r.value, r.priority, r.enabled, id],
+                    )
+                    .map_err(err)?;
+                if changed == 0 {
+                    return Err("这条规则已被删除。".into());
+                }
+                Ok(id)
+            }
+            None => self
+                .conn
+                .query_row(
+                    "INSERT INTO attribution_rules (name, field, value, priority, enabled) VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+                    p,
+                    |r| r.get(0),
+                )
+                .map_err(err),
+        }
+    }
+
+    pub fn delete_attribution_rule(&self, id: i64) -> Result<(), String> {
+        self.conn.execute("DELETE FROM attribution_rules WHERE id = ?1", [id]).map(|_| ()).map_err(err)
+    }
+
     /// Every group with its entries, in order of precedence.
     pub fn host_groups(&self) -> Result<Vec<HostGroupRow>, String> {
         let mut groups: Vec<HostGroupRow> = {
@@ -649,6 +716,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     }
     if version < 4 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V4} PRAGMA user_version = 4; COMMIT;")).map_err(err)?;
+    }
+    if version < 5 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V5} PRAGMA user_version = 5; COMMIT;")).map_err(err)?;
     }
     Ok(())
 }
@@ -820,6 +890,33 @@ mod tests {
         assert_eq!(id, again);
         assert_eq!(saved, vec![CycleRow { id: Some(id), ..c }]);
         assert!(store.cycles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attribution_rules_are_saved_listed_in_order_and_deleted() {
+        // Arrange
+        let store = Store::open_in_memory();
+        let rule = |name: &str, priority| AttributionRule {
+            id: None,
+            name: name.into(),
+            field: Field::Inbound,
+            value: "US-Workstation-Port".into(),
+            priority,
+            enabled: true,
+        };
+        let later = store.save_attribution_rule(&rule("后试", 20)).unwrap();
+        let first = store.save_attribution_rule(&rule("先试", 10)).unwrap();
+
+        // Act
+        store.save_attribution_rule(&AttributionRule { id: Some(later), enabled: false, ..rule("改名", 20) }).unwrap();
+        let listed = store.attribution_rules().unwrap();
+        store.delete_attribution_rule(first).unwrap();
+        let gone = store.save_attribution_rule(&AttributionRule { id: Some(first), ..rule("先试", 10) });
+
+        // Assert
+        assert_eq!(listed.iter().map(|r| (r.name.as_str(), r.enabled)).collect::<Vec<_>>(), [("先试", true), ("改名", false)]);
+        assert_eq!(store.attribution_rules().unwrap().len(), 1);
+        assert!(gone.is_err());
     }
 
     #[test]

@@ -36,7 +36,11 @@ PROGRAMS = [
     ("WeChat", 0.06, ["szextshort.weixin.qq.com", "mmbiz.qpic.cn"]),
     ("Steam", 0.08, ["cdn.steamstatic.com", "store.steampowered.com"]),
     ("", 0.04, ["time.apple.com", "dns.google"]),
+    # A container reaching the core through a listener of its own: the core sees no process.
+    ("", 0.05, ["registry-1.docker.io", "pypi.org", "files.pythonhosted.org"]),
 ]
+# Inbound a program always comes in through, by its place in PROGRAMS; the rest use INBOUNDS.
+DEDICATED_INBOUND = {len(PROGRAMS) - 1: "US-Workstation-Port"}
 # Node, the subscription it came from ("" for none), and its share of proxied traffic.
 NODES = [
     ("🇭🇰 香港 01", "白月光", 0.40),
@@ -91,7 +95,8 @@ class Core:
         self.started = time.time()
 
     def _open(self):
-        program, _, hosts = pick(PROGRAMS, lambda o: o[1])
+        index = pick(range(len(PROGRAMS)), lambda i: PROGRAMS[i][1])
+        program, share, hosts = PROGRAMS[index]
         host = random.choice(hosts)
         if program in DIRECT_HOSTS:
             chains, providers = ["DIRECT"], [""]
@@ -109,7 +114,7 @@ class Core:
                 "destinationIP": ip,
                 "host": "" if host[0].isdigit() else host,
                 "process": program,
-                "inboundName": pick(INBOUNDS, lambda o: o[1])[0],
+                "inboundName": DEDICATED_INBOUND.get(index) or pick(INBOUNDS, lambda o: o[1])[0],
             },
             "upload": 0,
             "download": 0,
@@ -117,7 +122,7 @@ class Core:
             "chains": chains,
             "providerChains": providers,
             "rule": "Match",
-            "weight": random.uniform(0.2, 3) * dict((p, w) for p, w, _ in PROGRAMS)[program],
+            "weight": random.uniform(0.2, 3) * share,
         }
 
     def tick(self):

@@ -54,9 +54,11 @@ function rangeDates(id: RangeId, weekStartsSunday: boolean): [string, string] {
 }
 
 /** How a key reads in the list; the empty key and DIRECT get words instead. */
-function keyLabel(tab: Tab, key: string): { text: string; muted: boolean } {
+function keyLabel(tab: Tab, row: RankRow): { text: string; muted: boolean } {
+  const key = row.key;
+  if (row.uncollected) return { text: "未采到连接明细", muted: true };
   if (!key) {
-    const text = { outbound: "未归类", subscription: "未归类", process: "未知进程", inbound: "未知入站", host: "其他" }[tab];
+    const text = { outbound: "未归类", subscription: "未归类", process: "进程未识别", inbound: "未知入站", host: "其他" }[tab];
     return { text, muted: true };
   }
   if (key === "DIRECT" && (tab === "outbound" || tab === "subscription")) return { text: "直连（DIRECT）", muted: false };
@@ -67,7 +69,8 @@ const HINTS: Record<Tab, string> = {
   outbound: "实际出站的节点（连接链路的第一跳）。「未归类」是连接在两次读取之间就已关闭、看不到去向的流量，以及开始按连接统计之前的流量。",
   subscription:
     "节点来自哪个订阅：配置里用了 proxy-providers 时取 provider 名；Clash Verge Rev 取当时启用的配置名。直连不属于任何订阅。",
-  process: "发起连接的程序。内核需要能查到进程：TUN 模式下通常默认可以，否则在配置中设置 find-process-mode: always。",
+  process:
+    "发起连接的程序。内核需要能查到进程：TUN 模式下通常默认可以，否则在配置中设置 find-process-mode: always。「进程未识别」是读到了连接、但内核没有给出进程名且没有命中归属规则的流量，展开可看它访问的域名；「未采到连接明细」是内核总量中没有被任何读到的连接计入的部分，例如两次读取之间就已关闭的连接。标有「规则」的是由「归属规则」页的规则命名的流量。",
   inbound: "流量从内核的哪个入口进来，例如混合端口、TUN，或为容器、局域网设备单独开的端口。",
   host: "访问的域名（没有域名时是 IP）。今天的数据完整；过去的每一天只保留用量最高的 200 个，其余计入「其他」。按分组查看时，属于同一分组的域名与 IP 合并为分组名称，分组在「域名分组」页管理；点行末的按钮可以把一个域名加入分组。",
 };
@@ -96,9 +99,12 @@ function Row({
   onToggle,
   indent,
   onAdd,
+  rule,
 }: {
   tab: Tab;
   row: RankRow;
+  /** The process name comes from an attribution rule. */
+  rule?: boolean;
   total: number;
   max: number;
   expandable?: boolean;
@@ -109,7 +115,7 @@ function Row({
   onAdd?: () => void;
 }) {
   const v = row.up + row.down;
-  const { text, muted } = keyLabel(tab, row.key);
+  const { text, muted } = keyLabel(tab, row);
   return (
     <div
       role={expandable ? "button" : undefined}
@@ -128,6 +134,7 @@ function Row({
         {expandable && <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted transition-transform", open && "rotate-90")} />}
         <span className={cn("selectable truncate", muted ? "text-muted" : "text-fg", indent && !row.group && "text-fg-2")}>{text}</span>
         {row.group && <Tag>分组</Tag>}
+        {rule && <Tag>规则</Tag>}
       </span>
       <Bar value={v} max={max} />
       <span className="text-right font-mono tabular-nums">{bytes(v)}</span>
@@ -210,6 +217,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
   const [error, setError] = useState<string | null>(null);
   const [all, setAll] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
+  const [ruleNames, setRuleNames] = useState<Set<string>>(new Set());
 
   const recorded = (sources ?? []).filter((s): s is Source & { id: number } => s.id !== null);
   const [from, to] = useMemo(() => rangeDates(range, weekStartsSunday), [range, weekStartsSunday]);
@@ -221,6 +229,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
   const load = useCallback(async () => {
     try {
       setRows(tab === "host" ? await api.hosts(from, to, source, null, null, view) : await api.ranking(tab, from, to, source));
+      if (tab === "process") setRuleNames(new Set((await api.attributionRules()).map((r) => r.name)));
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -298,8 +307,8 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
             ) : (
               <div>
                 {shown.map((r) => {
-                  const id = `${r.group ? "g:" : ""}${r.key}`;
-                  const expands = tab === "process" || (tab === "host" && !!r.group);
+                  const id = `${r.group ? "g:" : ""}${r.uncollected ? "u:" : ""}${r.key}`;
+                  const expands = (tab === "process" && !r.uncollected) || (tab === "host" && !!r.group);
                   return (
                     <div key={id}>
                       <Row
@@ -311,6 +320,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
                         open={open === id}
                         onToggle={() => setOpen((o) => (o === id ? null : id))}
                         onAdd={tab === "host" ? () => setAdding(r.key) : undefined}
+                        rule={tab === "process" && !!r.key && ruleNames.has(r.key)}
                       />
                       {expands && open === id && (
                         <SubHosts

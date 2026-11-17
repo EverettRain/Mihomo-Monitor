@@ -169,6 +169,7 @@ press "近 30 天" "点右上角的「近 30 天」"
 press "域名" "点「域名」" 0 exact
 press "YouTube" "点「YouTube」展开这个分组里的域名"; shot breakdown
 press "域名分组" "点左侧「域名分组」" 0 exact;   sleep 1; shot groups
+press "归属规则" "点左侧「归属规则」" 0 exact;   sleep 1; shot rules
 press "订阅" "点左侧「订阅」" 0 exact;           sleep 1; shot subscriptions
 press "内核" "点左侧「内核」" 0 exact;           shot sources
 press "设置" "点左侧「设置」" 0 exact;           shot settings

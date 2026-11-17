@@ -5,6 +5,7 @@
 //! Also answers the interface's questions.
 
 use super::discover::{self, Discovery, Found};
+use crate::domain::attribution::{AttributionRule, Attributor};
 use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{self, Reported};
 use crate::domain::hostgroup::{Matcher, Rule, RuleKind};
@@ -206,6 +207,10 @@ pub struct RankRow {
     /// The key is a host group's name rather than a host.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub group: bool,
+    /// Traffic the core counted that no connection read accounts for (key empty). Listed apart
+    /// for processes only, where the empty key itself is traffic of connections without one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub uncollected: bool,
 }
 
 fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
@@ -213,10 +218,17 @@ fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
 }
 
 fn ranked_marked(map: HashMap<(String, bool), Bytes>) -> Vec<RankRow> {
-    let mut rows: Vec<RankRow> =
-        map.into_iter().filter(|(_, b)| !b.is_zero()).map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group }).collect();
-    rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)));
+    let mut rows: Vec<RankRow> = map
+        .into_iter()
+        .filter(|(_, b)| !b.is_zero())
+        .map(|((key, group), b)| RankRow { key, up: b.up, down: b.down, group, uncollected: false })
+        .collect();
+    sort_rows(&mut rows);
     rows
+}
+
+fn sort_rows(rows: &mut [RankRow]) {
+    rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)).then(a.uncollected.cmp(&b.uncollected)));
 }
 
 /// How hosts are listed.
@@ -322,6 +334,8 @@ pub struct Monitor {
     wake: Notify,
     /// Host groups compiled for matching; rebuilt after they change.
     matcher: Mutex<Option<Arc<Matcher>>>,
+    /// The enabled attribution rules, read once and kept until they change.
+    attributor: Mutex<Option<Arc<Attributor>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -353,6 +367,7 @@ impl Monitor {
             sink: Box::new(sink),
             wake: Notify::new(),
             matcher: Mutex::new(None),
+            attributor: Mutex::new(None),
         })
     }
 
@@ -517,8 +532,10 @@ impl Monitor {
                 self.note_reports(p.reported().to_vec());
                 p.active().map(str::to_string)
             });
+            // Rules as they are now: a change applies from the next reading on.
+            let rules = self.attributor()?;
             let deltas: Vec<(Dims, Bytes)> =
-                tracker.step(&snap.conns).into_iter().map(|(c, b)| (split::dims_of(c, subscription.as_deref()), b)).collect();
+                tracker.step(&snap.conns).into_iter().map(|(c, b)| (split::dims_of(c, subscription.as_deref(), &rules), b)).collect();
             if !self.account(&f.key, id, f.core.as_ref(), prev, snap.totals, &deltas, paths::now_secs()) {
                 return Ok(());
             }
@@ -829,17 +846,28 @@ impl Monitor {
 
     /// Traffic per key of one dimension over the local days `from` through `to`, biggest first.
     /// Dimensions other than the outbound one know only part of the traffic (and nothing before
-    /// per-connection collection began); the rest is listed under the empty key.
+    /// per-connection collection began); the rest is listed under the empty key. For processes
+    /// the rest is a row of its own, marked `uncollected`, and the empty key is only the traffic
+    /// of connections the core named no process for and no rule matched.
     pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
         let mut map = self.kind_sums(kind, range, source)?;
-        if kind != DimKind::Outbound {
-            let total = Prefix::new(self.buckets(range, source)?).sum(range);
-            let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
-            let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
-            *map.entry(String::new()).or_default() += rest;
+        if kind == DimKind::Outbound {
+            return Ok(ranked(map));
         }
-        Ok(ranked(map))
+        let total = Prefix::new(self.buckets(range, source)?).sum(range);
+        let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
+        let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
+        if kind != DimKind::Process {
+            *map.entry(String::new()).or_default() += rest;
+            return Ok(ranked(map));
+        }
+        let mut rows = ranked(map);
+        if !rest.is_zero() {
+            rows.push(RankRow { key: String::new(), up: rest.up, down: rest.down, group: false, uncollected: true });
+            sort_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// Traffic per key of one dimension in `range`, written and pending.
@@ -989,10 +1017,40 @@ impl Monitor {
                     r.up += folded.up;
                     r.down += folded.down;
                 }
-                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down, group: false }),
+                None => all.push(RankRow { key: String::new(), up: folded.up, down: folded.down, group: false, uncollected: false }),
             }
         }
         Ok(all)
+    }
+
+    fn attributor(&self) -> Result<Arc<Attributor>, String> {
+        // Held while loading, so a change saved meanwhile clears what we load rather than being
+        // overwritten by it. Saving takes the two locks one after the other, never together.
+        let mut cached = lock(&self.attributor);
+        if let Some(a) = cached.as_ref() {
+            return Ok(a.clone());
+        }
+        let a = Arc::new(Attributor::new(lock(&self.store).attribution_rules()?));
+        *cached = Some(a.clone());
+        Ok(a)
+    }
+
+    pub fn attribution_rules(&self) -> Result<Vec<AttributionRule>, String> {
+        lock(&self.store).attribution_rules()
+    }
+
+    /// Adds or changes a rule. It names traffic read from now on; what was recorded stays.
+    pub fn save_attribution_rule(&self, rule: AttributionRule) -> Result<i64, String> {
+        let rule = rule.checked()?;
+        let result = lock(&self.store).save_attribution_rule(&rule);
+        *lock(&self.attributor) = None;
+        result
+    }
+
+    pub fn delete_attribution_rule(&self, id: i64) -> Result<(), String> {
+        let result = lock(&self.store).delete_attribution_rule(id);
+        *lock(&self.attributor) = None;
+        result
     }
 
     fn matcher(&self) -> Result<Arc<Matcher>, String> {
@@ -1264,6 +1322,65 @@ mod tests {
             [("YouTube", 700, true), ("qq.com", 200, false)]
         );
         assert_eq!(members.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["www.youtube.com", "i.ytimg.com"]);
+    }
+
+    #[test]
+    fn attribution_rules_name_later_traffic_without_changing_the_total() {
+        // Arrange: two readings of 500 bytes down each. A container's connection through its own
+        // inbound has no process; curl, through the same inbound, has one; 100 bytes of each
+        // reading went through connections that closed unseen. The rule arrives in between.
+        use crate::domain::attribution::Field;
+        use crate::domain::split::Conn;
+        let (m, id) = monitor_with_source();
+        let at = noon().timestamp().as_second();
+        let conn = |process: &str, host: &str, down: u64| Conn {
+            id: format!("{process}{host}"),
+            bytes: Bytes::new(0, down),
+            chains: vec!["HK 01".into()],
+            provider_chains: vec![String::new()],
+            process: process.into(),
+            inbound: "US-Workstation-Port".into(),
+            host: host.into(),
+        };
+        let read = |m: &Monitor, prev: u64, total: u64| {
+            let rules = m.attributor().unwrap();
+            let conns: Vec<(Dims, Bytes)> = [conn("", "api.example.com", 300), conn("curl", "example.org", 100)]
+                .iter()
+                .map(|c| (split::dims_of(c, None, &rules), c.bytes))
+                .collect();
+            m.account("a", id, None, Some(Bytes::new(0, prev)), Bytes::new(0, total), &conns, at + total as i64);
+        };
+        m.account("a", id, None, None, Bytes::ZERO, &[], at);
+        read(&m, 0, 500);
+        m.save_attribution_rule(AttributionRule {
+            id: None,
+            name: "Container: us-workstation".into(),
+            field: Field::Inbound,
+            value: "US-Workstation-Port".into(),
+            priority: 10,
+            enabled: true,
+        })
+        .unwrap();
+        read(&m, 500, 1_000);
+        let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
+        let rank = |kind| m.ranking(kind, today, today, Some(id)).unwrap();
+
+        // Act
+        let process = rank(DimKind::Process);
+        let outbound = rank(DimKind::Outbound);
+        let named = m.hosts(today, today, Some(id), Some("Container: us-workstation"), None, HostView::Host, 10).unwrap();
+        let unnamed = m.hosts(today, today, Some(id), Some(""), None, HostView::Host, 10).unwrap();
+
+        // Assert
+        assert_eq!(
+            process.iter().map(|r| (r.key.as_str(), r.down, r.uncollected)).collect::<Vec<_>>(),
+            [("", 300, false), ("Container: us-workstation", 300, false), ("", 200, true), ("curl", 200, false)]
+        );
+        let sum = |rows: &[RankRow]| rows.iter().map(|r| r.down).sum::<u64>();
+        assert_eq!(sum(&process), 1_000);
+        assert_eq!(sum(&outbound), 1_000);
+        assert_eq!(named.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("api.example.com", 300)]);
+        assert_eq!(unnamed.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("api.example.com", 300)]);
     }
 
     #[test]

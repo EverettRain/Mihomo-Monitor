@@ -5,7 +5,11 @@
 //! their last bytes with them, so the core's total grows by more than the connections we saw;
 //! that remainder is "unattributed" (the empty key). The outbound split always adds up to the
 //! total; the other dimensions keep only what they know, and the views derive their remainder.
+//! A connection without a value for a dimension is kept under that dimension's empty key: for
+//! processes, that is traffic the core saw but could not tie to a program, apart from the
+//! remainder no connection accounts for.
 
+use super::attribution::Attributor;
 use super::counter::Bytes;
 use std::collections::HashMap;
 
@@ -66,8 +70,9 @@ fn is_direct(outbound: &str) -> bool {
 
 /// The dimensions of a connection. Its subscription is the proxy-provider of its node when it
 /// has one; otherwise `client_subscription`, the profile the client had active (clients such as
-/// Clash Verge Rev expand a subscription into plain `proxies`, so the core never sees it).
-pub fn dims_of(c: &Conn, client_subscription: Option<&str>) -> Dims {
+/// Clash Verge Rev expand a subscription into plain `proxies`, so the core never sees it). Its
+/// process is the core's, or, when the core has none, what the attribution rules name it.
+pub fn dims_of(c: &Conn, client_subscription: Option<&str>, rules: &Attributor) -> Dims {
     let outbound = c.chains.first().cloned().unwrap_or_default();
     let subscription = if outbound.is_empty() {
         String::new()
@@ -76,7 +81,7 @@ pub fn dims_of(c: &Conn, client_subscription: Option<&str>) -> Dims {
     } else {
         c.provider_chains.iter().find(|p| !p.is_empty()).cloned().or_else(|| client_subscription.map(str::to_string)).unwrap_or_default()
     };
-    Dims { outbound, subscription, process: c.process.clone(), inbound: c.inbound.clone(), host: c.host.clone() }
+    Dims { outbound, subscription, process: rules.process_of(c).to_string(), inbound: c.inbound.clone(), host: c.host.clone() }
 }
 
 /// Remembers each open connection's counters between snapshots.
@@ -178,7 +183,7 @@ mod tests {
         let c = conn("1", 0, 0, &["🇺🇸 美国 xtls-reality", "US-Global", "US-Workstation"]);
 
         // Act
-        let d = dims_of(&c, Some("白月光"));
+        let d = dims_of(&c, Some("白月光"), &Attributor::default());
 
         // Assert
         assert_eq!(d.outbound, "🇺🇸 美国 xtls-reality");
@@ -192,7 +197,7 @@ mod tests {
         c.provider_chains = vec!["机场A".into(), String::new()];
 
         // Act
-        let d = dims_of(&c, Some("白月光"));
+        let d = dims_of(&c, Some("白月光"), &Attributor::default());
 
         // Assert
         assert_eq!(d.subscription, "机场A");
@@ -201,7 +206,8 @@ mod tests {
     #[test]
     fn direct_traffic_belongs_to_no_subscription() {
         // Act
-        let d = [&["DIRECT"][..], &["REJECT-DROP"], &[]].map(|chains| dims_of(&conn("1", 0, 0, chains), Some("白月光")).subscription);
+        let d = [&["DIRECT"][..], &["REJECT-DROP"], &[]]
+            .map(|chains| dims_of(&conn("1", 0, 0, chains), Some("白月光"), &Attributor::default()).subscription);
 
         // Assert
         assert_eq!(d, [DIRECT.to_string(), DIRECT.to_string(), String::new()]);
@@ -240,8 +246,8 @@ mod tests {
     #[test]
     fn the_outbound_split_adds_up_to_the_total() {
         // Arrange
-        let hk = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), Some("白月光"));
-        let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), Some("白月光"));
+        let hk = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), Some("白月光"), &Attributor::default());
+        let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), Some("白月光"), &Attributor::default());
 
         // Act
         let s = split(Bytes::new(100, 1_000), &[(hk, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
@@ -254,6 +260,48 @@ mod tests {
         assert_eq!(s.dims[&(DimKind::Subscription, DIRECT.into())], Bytes::new(10, 100));
         assert_eq!(s.hosts[&("Safari".into(), "example.com".into())], Bytes::new(40, 700));
         assert!(!s.dims.contains_key(&(DimKind::Process, String::new())));
+    }
+
+    #[test]
+    fn naming_traffic_moves_it_between_processes_without_adding_any() {
+        // Arrange: one connection the core named, two it did not, one of them through the
+        // inbound a rule names.
+        use crate::domain::attribution::{AttributionRule, Field};
+        let rules = Attributor::new([AttributionRule {
+            id: Some(1),
+            name: "Container: us-workstation".into(),
+            field: Field::Inbound,
+            value: "US-Workstation-Port".into(),
+            priority: 10,
+            enabled: true,
+        }]);
+        let conns = [
+            Conn { process: "Safari".into(), inbound: "US-Workstation-Port".into(), ..conn("1", 0, 0, &["HK"]) },
+            Conn { process: String::new(), inbound: "US-Workstation-Port".into(), ..conn("2", 0, 0, &["HK"]) },
+            Conn { process: String::new(), inbound: "DEFAULT-MIXED".into(), ..conn("3", 0, 0, &["DIRECT"]) },
+        ];
+        let grown = [Bytes::new(10, 100), Bytes::new(20, 300), Bytes::new(5, 50)];
+        let total = Bytes::new(40, 500);
+        let by =
+            |rules: &Attributor| -> Vec<(Dims, Bytes)> { conns.iter().zip(grown).map(|(c, b)| (dims_of(c, None, rules), b)).collect() };
+        let sum = |s: &Split, kind: DimKind| s.dims.iter().filter(|((k, _), _)| *k == kind).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+
+        // Act
+        let plain = split(total, &by(&Attributor::default()));
+        let named = split(total, &by(&rules));
+
+        // Assert
+        assert_eq!(named.dims[&(DimKind::Process, "Container: us-workstation".into())], Bytes::new(20, 300));
+        assert_eq!(named.dims[&(DimKind::Process, "Safari".into())], Bytes::new(10, 100));
+        assert_eq!(named.dims[&(DimKind::Process, String::new())], Bytes::new(5, 50));
+        assert_eq!(plain.dims[&(DimKind::Process, String::new())], Bytes::new(25, 350));
+        for kind in DimKind::ALL {
+            assert_eq!(sum(&named, kind), sum(&plain, kind), "{kind:?}");
+        }
+        assert_eq!(sum(&named, DimKind::Outbound), total);
+        let hosts = |s: &Split| s.hosts.values().fold(Bytes::ZERO, |a, v| a + *v);
+        assert_eq!(hosts(&named), hosts(&plain));
+        assert_eq!(named.hosts[&("Container: us-workstation".into(), "example.com".into())], Bytes::new(20, 300));
     }
 
     #[test]

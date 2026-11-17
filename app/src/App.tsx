@@ -5,6 +5,7 @@ import { api, type AppInfo, type Source } from "@/lib/api";
 import { useTheme } from "@/lib/theme";
 import { AboutPage } from "@/pages/AboutPage";
 import { BreakdownPage } from "@/pages/BreakdownPage";
+import { AttributionPage } from "@/pages/AttributionPage";
 import { GroupsPage } from "@/pages/GroupsPage";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { OverviewPage } from "@/pages/OverviewPage";
@@ -41,6 +42,7 @@ export default function App() {
       {page === "history" && <HistoryPage sources={sources} />}
       {page === "breakdown" && <BreakdownPage sources={sources} />}
       {page === "groups" && <GroupsPage />}
+      {page === "rules" && <AttributionPage />}
       {page === "subscriptions" && <SubscriptionsPage />}
       {page === "sources" && <SourcesPage sources={sources} />}
       {page === "settings" && <SettingsPage info={info} />}

@@ -1,6 +1,7 @@
 //! Tauri commands the interface calls.
 
 use super::tray;
+use crate::domain::attribution::AttributionRule;
 use crate::domain::hostgroup::RuleKind;
 use crate::domain::period::Period;
 use crate::domain::split::DimKind;
@@ -147,6 +148,21 @@ pub fn hosts(
     view: HostView,
 ) -> Result<Vec<RankRow>, String> {
     monitor.hosts(date(&from)?, date(&to)?, source, process.as_deref(), group.as_deref(), view, 100)
+}
+
+#[tauri::command]
+pub fn attribution_rules(monitor: Mon) -> Result<Vec<AttributionRule>, String> {
+    monitor.attribution_rules()
+}
+
+#[tauri::command]
+pub fn save_attribution_rule(monitor: Mon, rule: AttributionRule) -> Result<i64, String> {
+    monitor.save_attribution_rule(rule)
+}
+
+#[tauri::command]
+pub fn delete_attribution_rule(monitor: Mon, id: i64) -> Result<(), String> {
+    monitor.delete_attribution_rule(id)
 }
 
 #[tauri::command]

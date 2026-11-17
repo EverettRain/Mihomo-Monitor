@@ -8,7 +8,9 @@ this only adds history to that source, in the app's own 15-minute buckets. The n
 fictional: a daily rhythm, quieter weekends, the odd big download. The last 90 days are also
 split by node, subscription, program and inbound, with the hosts of each day, using the names
 fake-mihomo.py uses; older traffic stays unattributed, as for someone who upgraded from a
-version without the split. Standard library only.
+version without the split. The container fake-mihomo.py lists without a process is recorded
+under the name of an attribution rule for its inbound, as if the rule had been there all along.
+Standard library only.
 """
 
 import json
@@ -27,6 +29,11 @@ fake = import_module("fake-mihomo")
 BUCKET = 15 * 60
 DAYS = 400
 SPLIT_DAYS = 90
+# Attribution rules: name, inbound, priority, enabled. The first names fake-mihomo.py's container.
+RULES = [
+    ("Container: us-workstation", "US-Workstation-Port", 10, True),
+    ("Homelab NAS", "LAN-NAS-Port", 20, False),
+]
 
 
 def main():
@@ -42,13 +49,20 @@ def main():
         return db.execute("SELECT id FROM dims WHERE kind = ? AND key = ?", (kind, key)).fetchone()[0]
 
     unattributed = dim("outbound", "")
-    programs = [(name, w, hosts) for name, w, hosts in fake.PROGRAMS]
-    direct_share = sum(w for name, w, _ in programs if name in fake.DIRECT_HOSTS)
+    # Each program as the app records it: a rule names what the core could not.
+    named = {inbound: name for name, inbound, _, on in RULES if on}
+    programs = []
+    for i, (name, w, hosts) in enumerate(fake.PROGRAMS):
+        inbound = fake.DEDICATED_INBOUND.get(i)
+        programs.append((name or named.get(inbound, ""), w, hosts, inbound))
+    direct_share = sum(w for name, w, _ in fake.PROGRAMS if name in fake.DIRECT_HOSTS)
+    shared = sum(w for _, w, _, inbound in programs if inbound is None)
+    inbounds = [(name, shared * w) for name, w in fake.INBOUNDS] + [(inbound, w) for _, w, _, inbound in programs if inbound]
     shares = {
         "outbound": [(n, (1 - direct_share) * w) for n, _, w in fake.NODES] + [("DIRECT", direct_share)],
         "subscription": [("白月光", (1 - direct_share) * 0.8), ("备用机场", (1 - direct_share) * 0.2), ("DIRECT", direct_share)],
-        "process": [(name, w) for name, w, _ in programs],
-        "inbound": [(name, w) for name, w in fake.INBOUNDS],
+        "process": [(name, w) for name, w, _, _ in programs],
+        "inbound": inbounds,
     }
     ids = {(k, key): dim(k, key) for k, opts in shares.items() for key, _ in opts}
 
@@ -90,7 +104,7 @@ def main():
             # Hosts cover what the listed connections carried: the day's traffic minus the unseen part.
             seen_up, seen_down = day_up * (1 - fake.UNSEEN), day_down * (1 - fake.UNSEEN)
             day = time.strftime("%Y-%m-%d", time.localtime(day_start))
-            for name, w, hosts in programs:
+            for name, w, hosts, _ in programs:
                 for i, host in enumerate(hosts):
                     f = w * (0.6 ** i) / sum(0.6 ** j for j in range(len(hosts))) * random.uniform(0.9, 1.1)
                     host_rows.append((source, day, ids[("process", name)], dim("domain", host), int(seen_up * f), int(seen_down * f)))
@@ -122,6 +136,10 @@ def main():
         db.execute("INSERT OR IGNORE INTO host_groups (name, note, created_at) VALUES (?, '', ?)", (name, now))
         gid = db.execute("SELECT id FROM host_groups WHERE name = ?", (name,)).fetchone()[0]
         db.executemany("INSERT OR IGNORE INTO host_rules (group_id, kind, value) VALUES (?, ?, ?)", [(gid, k, v) for k, v in rules])
+    db.executemany(
+        "INSERT INTO attribution_rules (name, field, value, priority, enabled) VALUES (?, 'inbound', ?, ?, ?)",
+        [(name, inbound, priority, int(on)) for name, inbound, priority, on in RULES],
+    )
     db.commit()
     print(f"added {len(rows)} traffic rows and {len(host_rows)} host rows to source {source}")
 

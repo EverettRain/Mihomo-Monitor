@@ -81,6 +81,27 @@ export interface RankRow extends Bytes {
   key: string;
   /** The key is a host group's name. */
   group?: boolean;
+  /**
+   * Traffic the core counted that no connection read accounts for (key empty). Only processes list
+   * it apart; their plain empty key is traffic of connections the core named no process for.
+   */
+  uncollected?: boolean;
+}
+
+/** What an attribution rule looks at: so far the inbound's name, compared exactly. */
+export type AttributionField = "inbound";
+
+/** Names traffic of connections the core gave no process, by a fact it does record. */
+export interface AttributionRule {
+  /** null for a rule not saved yet. */
+  id: number | null;
+  /** Shown as the process of the traffic the rule matches. */
+  name: string;
+  field: AttributionField;
+  value: string;
+  /** Rules are tried from the lowest number up. */
+  priority: number;
+  enabled: boolean;
 }
 
 /** How hosts are listed: as connected to, under their registrable domain, or under their group. */
@@ -219,6 +240,9 @@ export const api = {
   ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
   hosts: (from: string, to: string, source: number | null, process: string | null, group: string | null, view: HostView) =>
     invoke<RankRow[]>("hosts", { from, to, source, process, group, view }),
+  attributionRules: () => invoke<AttributionRule[]>("attribution_rules"),
+  saveAttributionRule: (rule: AttributionRule) => invoke<number>("save_attribution_rule", { rule }),
+  deleteAttributionRule: (id: number) => invoke<void>("delete_attribution_rule", { id }),
   hostGroups: () => invoke<HostGroup[]>("host_groups"),
   createGroup: (name: string, note: string) => invoke<number>("create_group", { name, note }),
   updateGroup: (id: number, name: string, note: string) => invoke<void>("update_group", { id, name, note }),
