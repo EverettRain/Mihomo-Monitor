@@ -140,6 +140,12 @@ impl Client {
         parse_providers(&body).ok_or_else(|| ApiError::Unexpected("订阅信息格式无法识别".into()))
     }
 
+    /// The type of every outbound the core has (`Direct`, `Shadowsocks`, `Selector`, …), by name.
+    pub async fn proxy_types(&self) -> Result<std::collections::HashMap<String, String>, ApiError> {
+        let body = self.get("/proxies").await?.bytes().await.map_err(unreachable)?;
+        parse_proxy_types(&body).ok_or_else(|| ApiError::Unexpected("出站列表格式无法识别".into()))
+    }
+
     pub async fn traffic(&self) -> Result<TrafficStream, ApiError> {
         Ok(TrafficStream { resp: self.get("/traffic").await?, buf: Vec::new() })
     }
@@ -282,6 +288,21 @@ pub fn parse_providers(body: &[u8]) -> Option<Vec<(String, Reported)>> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Some(out)
+}
+
+/// Parses `/proxies` into each outbound's type.
+pub fn parse_proxy_types(body: &[u8]) -> Option<std::collections::HashMap<String, String>> {
+    #[derive(Deserialize)]
+    struct Body {
+        proxies: std::collections::HashMap<String, Proxy>,
+    }
+    #[derive(Deserialize)]
+    struct Proxy {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let b: Body = serde_json::from_slice(body).ok()?;
+    Some(b.proxies.into_iter().map(|(name, p)| (name, p.kind)).collect())
 }
 
 /// Parses one `/traffic` line; blank or foreign lines give `None`.
@@ -459,5 +480,20 @@ mod tests {
 
         // Assert
         assert_eq!(result, Err(ApiError::Unauthorized));
+    }
+
+    #[test]
+    fn reads_the_type_of_each_outbound() {
+        // Arrange: trimmed from mihomo v1.19, a group and a custom direct outbound among them.
+        let body = r#"{"proxies":{"DIRECT":{"type":"Direct","udp":true},"直连-以太网":{"type":"Direct"},
+            "HK 01":{"type":"Shadowsocks"},"节点选择":{"type":"Selector","now":"HK 01","all":["HK 01"]}}}"#;
+
+        // Act
+        let types = parse_proxy_types(body.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(types["直连-以太网"], "Direct");
+        assert_eq!(types["HK 01"], "Shadowsocks");
+        assert_eq!(types.len(), 4);
     }
 }

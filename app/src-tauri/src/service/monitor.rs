@@ -10,7 +10,7 @@ use crate::domain::counter::{self, Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{self, Reported};
 use crate::domain::hostgroup::{Matcher, Rule, RuleKind};
 use crate::domain::period::{self, bucket_of, Period, Range};
-use crate::domain::split::{self, DimKind, Dims, Tracker};
+use crate::domain::split::{self, DimKind, Dims, OutboundTypes, Route, Tracker};
 use crate::infra::import::{self, Entry, Format, Parsed, Problem};
 use crate::infra::mihomo::Client;
 use crate::infra::store::{Added, BucketDelta, CycleRow, HostDelta, HostGroupRow, Store};
@@ -36,6 +36,8 @@ const HOSTS_PER_PROCESS: usize = 10;
 /// How often providers' usage reports are fetched from a core; they change only when the client
 /// refreshes the subscription.
 const REPORTS_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How soon outbound types are read again when a connection uses an outbound not among them.
+const TYPES_RETRY: Duration = Duration::from_secs(60);
 /// Subscriptions with traffic within this many days are listed even without a cycle.
 const SUBSCRIPTIONS_SEEN_DAYS: i64 = 400;
 
@@ -211,6 +213,14 @@ pub struct RankRow {
     /// for processes only, where the empty key itself is traffic of connections without one.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub uncollected: bool,
+}
+
+/// Whether a pending row counts toward the total of `route`, or of all traffic.
+fn in_scope(kind: DimKind, key: &str, route: Option<Route>) -> bool {
+    match route {
+        None => kind == DimKind::Outbound,
+        Some(r) => kind == DimKind::Route && key == r.key(),
+    }
 }
 
 fn ranked(map: HashMap<String, Bytes>) -> Vec<RankRow> {
@@ -517,14 +527,29 @@ impl Monitor {
         let mut tick = tokio::time::interval(POLL_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut reports_due = tokio::time::Instant::now();
+        let mut types = OutboundTypes::new();
+        let mut types_read: Option<tokio::time::Instant> = None;
         loop {
             tick.tick().await;
             let snap = client.connections().await.map_err(|e| e.to_string())?;
-            if tokio::time::Instant::now() >= reports_due {
+            let now = tokio::time::Instant::now();
+            if now >= reports_due {
                 reports_due += REPORTS_EVERY;
                 // A core without providers, or an older one, simply has nothing to report.
                 if let Ok(list) = client.providers().await {
                     self.note_reports(list);
+                }
+            }
+            // Outbound types tell direct traffic from proxied. Read again with the reports, and
+            // sooner when a connection uses an outbound we have not seen (the config changed).
+            let unseen = snap.conns.iter().filter_map(|c| c.chains.first()).any(|o| !o.is_empty() && !types.contains_key(o));
+            let due =
+                types_read.is_none_or(|at| now.duration_since(at) >= REPORTS_EVERY || (unseen && now.duration_since(at) >= TYPES_RETRY));
+            if due {
+                types_read = Some(now);
+                // Without them, mihomo's built-in names still tell DIRECT and REJECT apart.
+                if let Ok(t) = client.proxy_types().await {
+                    types = t;
                 }
             }
             let subscription = profiles.as_mut().and_then(|p| {
@@ -534,8 +559,11 @@ impl Monitor {
             });
             // Rules as they are now: a change applies from the next reading on.
             let rules = self.attributor()?;
-            let deltas: Vec<(Dims, Bytes)> =
-                tracker.step(&snap.conns).into_iter().map(|(c, b)| (split::dims_of(c, subscription.as_deref(), &rules), b)).collect();
+            let deltas: Vec<(Dims, Bytes)> = tracker
+                .step(&snap.conns)
+                .into_iter()
+                .map(|(c, b)| (split::dims_of(c, subscription.as_deref(), &rules, &types), b))
+                .collect();
             if !self.account(&f.key, id, f.core.as_ref(), prev, snap.totals, &deltas, paths::now_secs()) {
                 return Ok(());
             }
@@ -689,14 +717,14 @@ impl Monitor {
     }
 
     /// Traffic per source in `range`: what is in the database plus what is still pending.
-    fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
+    fn sums_by_source(&self, range: Range, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
             .pending
             .iter()
-            .filter(|((_, b, kind, _), _)| *kind == DimKind::Outbound && range.contains(*b))
+            .filter(|((_, b, kind, key), _)| in_scope(*kind, key, route) && range.contains(*b))
             .map(|((s, ..), v)| (*s, *v))
             .collect();
-        let mut out = lock(&self.store).sums_by_source(range)?;
+        let mut out = lock(&self.store).sums_by_source(range, route)?;
         for (s, v) in pending {
             match out.iter_mut().find(|(id, _)| *id == s) {
                 Some((_, total)) => *total += v,
@@ -706,24 +734,32 @@ impl Monitor {
         Ok(out)
     }
 
-    /// Traffic per bucket in `range`: what is in the database plus what is still pending.
-    fn buckets(&self, range: Range, source: Option<i64>) -> Result<Vec<(i64, Bytes)>, String> {
+    /// Traffic per bucket in `range`, all or one route's: what is in the database plus what is
+    /// still pending.
+    fn buckets(&self, range: Range, source: Option<i64>, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let pending: Vec<(i64, Bytes)> = lock(&self.state)
             .pending
             .iter()
-            .filter(|((s, b, kind, _), _)| *kind == DimKind::Outbound && source.is_none_or(|x| x == *s) && range.contains(*b))
+            .filter(|((s, b, kind, key), _)| in_scope(*kind, key, route) && source.is_none_or(|x| x == *s) && range.contains(*b))
             .map(|((_, b, ..), v)| (*b, *v))
             .collect();
-        let mut rows = lock(&self.store).buckets(range, source)?;
+        let mut rows = lock(&self.store).buckets(range, source, route)?;
         rows.extend(pending);
         Ok(rows)
     }
 
-    pub fn overview(&self, source: Option<i64>, week_starts_sunday: bool) -> Result<Overview, String> {
-        self.overview_at(&ZonedDateTime::now(), source, week_starts_sunday)
+    /// The figures of the overview, of all traffic or of one route's.
+    pub fn overview(&self, source: Option<i64>, route: Option<Route>, week_starts_sunday: bool) -> Result<Overview, String> {
+        self.overview_at(&ZonedDateTime::now(), source, route, week_starts_sunday)
     }
 
-    fn overview_at(&self, now: &ZonedDateTime, source: Option<i64>, week_starts_sunday: bool) -> Result<Overview, String> {
+    fn overview_at(
+        &self,
+        now: &ZonedDateTime,
+        source: Option<i64>,
+        route: Option<Route>,
+        week_starts_sunday: bool,
+    ) -> Result<Overview, String> {
         let week_start = if week_starts_sunday { Weekday::Sunday } else { Weekday::Monday };
         let p = |kind| period::current(kind, now, week_start).map_err(|e| e.to_string());
         let (day, week, month, year) = (p(Period::Day)?, p(Period::Week)?, p(Period::Month)?, p(Period::Year)?);
@@ -732,7 +768,7 @@ impl Monitor {
         // One read covers every view: from the earliest start to the latest end.
         let start = [day.start, week.start, month.start, year.start, days[0].1.start].into_iter().min().unwrap_or(day.start);
         let end = [day.end, week.end, month.end, year.end].into_iter().max().unwrap_or(day.end);
-        let prefix = Prefix::new(self.buckets(Range { start, end }, source)?);
+        let prefix = Prefix::new(self.buckets(Range { start, end }, source, route)?);
         let sum = |r: Range| prefix.sum(r);
         let everything = Range { start: i64::MIN, end: i64::MAX };
         Ok(Overview {
@@ -741,12 +777,12 @@ impl Monitor {
             month: sum(month),
             year: sum(year),
             all_time: self
-                .sums_by_source(everything)?
+                .sums_by_source(everything, route)?
                 .into_iter()
                 .filter(|(id, _)| source.is_none_or(|s| s == *id))
                 .fold(Bytes::ZERO, |a, (_, v)| a + v),
             by_source: {
-                let (today, month) = (self.sums_by_source(day)?, self.sums_by_source(month)?);
+                let (today, month) = (self.sums_by_source(day, route)?, self.sums_by_source(month, route)?);
                 let of = |list: &[(i64, Bytes)], id: i64| list.iter().find(|(s, _)| *s == id).map(|(_, v)| *v).unwrap_or_default();
                 lock(&self.store)
                     .sources()?
@@ -778,11 +814,13 @@ impl Monitor {
         from: Date,
         to: Date,
         source: Option<i64>,
+        route: Option<Route>,
         week_starts_sunday: bool,
     ) -> Result<Vec<PeriodRow>, String> {
-        self.history_in(&TimeZone::system(), kind, from, to, source, week_starts_sunday)
+        self.history_in(&TimeZone::system(), kind, from, to, source, route, week_starts_sunday)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn history_in(
         &self,
         tz: &TimeZone,
@@ -790,6 +828,7 @@ impl Monitor {
         from: Date,
         to: Date,
         source: Option<i64>,
+        route: Option<Route>,
         week_starts_sunday: bool,
     ) -> Result<Vec<PeriodRow>, String> {
         if to < from {
@@ -800,7 +839,7 @@ impl Monitor {
         }
         let periods = period::periods(kind, from, to, tz, week_start(week_starts_sunday)).map_err(|e| e.to_string())?;
         let (Some(first), Some(last)) = (periods.first(), periods.last()) else { return Ok(Vec::new()) };
-        let prefix = Prefix::new(self.buckets(Range { start: first.1.start, end: last.1.end }, source)?);
+        let prefix = Prefix::new(self.buckets(Range { start: first.1.start, end: last.1.end }, source, route)?);
         Ok(periods
             .iter()
             .map(|(z, r)| {
@@ -827,11 +866,11 @@ impl Monitor {
         }
     }
 
-    /// The `n` days with the most traffic, biggest first (vnstat's top list).
-    pub fn top_days(&self, source: Option<i64>, n: usize) -> Result<Vec<PeriodRow>, String> {
+    /// The `n` days with the most traffic (of all or of one route), biggest first (vnstat's top list).
+    pub fn top_days(&self, source: Option<i64>, route: Option<Route>, n: usize) -> Result<Vec<PeriodRow>, String> {
         let Some(b) = self.bounds(source)? else { return Ok(Vec::new()) };
         let parse = |s: &str| s.parse::<Date>().map_err(|e| e.to_string());
-        let mut days = self.history(Period::Day, parse(&b.first)?, parse(&b.last)?, source, false)?;
+        let mut days = self.history(Period::Day, parse(&b.first)?, parse(&b.last)?, source, route, false)?;
         days.retain(|d| d.up + d.down > 0);
         days.sort_by_key(|d| std::cmp::Reverse(d.up + d.down));
         days.truncate(n);
@@ -852,10 +891,11 @@ impl Monitor {
     pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
         let mut map = self.kind_sums(kind, range, source)?;
-        if kind == DimKind::Outbound {
+        // These two add up to the total by themselves, their remainder included.
+        if matches!(kind, DimKind::Outbound | DimKind::Route) {
             return Ok(ranked(map));
         }
-        let total = Prefix::new(self.buckets(range, source)?).sum(range);
+        let total = Prefix::new(self.buckets(range, source, None)?).sum(range);
         let known = map.values().fold(Bytes::ZERO, |a, b| a + *b);
         let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
         if kind != DimKind::Process {
@@ -1137,7 +1177,7 @@ impl Monitor {
 
     /// Today's traffic of every source, for the tray.
     pub fn today(&self) -> Bytes {
-        self.overview(None, false).map(|o| o.today).unwrap_or_default()
+        self.overview(None, None, false).map(|o| o.today).unwrap_or_default()
     }
 }
 
@@ -1188,9 +1228,9 @@ mod tests {
         }
 
         // Act
-        let before = m.overview_at(&noon(), Some(id), false).unwrap().today;
+        let before = m.overview_at(&noon(), Some(id), None, false).unwrap().today;
         m.flush().unwrap();
-        let after = m.overview_at(&noon(), Some(id), false).unwrap().today;
+        let after = m.overview_at(&noon(), Some(id), None, false).unwrap().today;
 
         // Assert: the first reading of a new source is a baseline; the rest is counted once.
         assert_eq!(before, Bytes::new(80, 1_000));
@@ -1217,8 +1257,8 @@ mod tests {
         read("b", b, Bytes::new(5, 50), now + 1, Some(Bytes::ZERO));
 
         // Act
-        let all = m.overview_at(&noon(), None, false).unwrap();
-        let only_a = m.overview_at(&noon(), Some(a), false).unwrap();
+        let all = m.overview_at(&noon(), None, None, false).unwrap();
+        let only_a = m.overview_at(&noon(), Some(a), None, false).unwrap();
 
         // Assert
         assert_eq!(all.today, Bytes::new(7, 70));
@@ -1246,9 +1286,9 @@ mod tests {
         let (from, to) = (jiff::civil::date(2026, 11, 15), jiff::civil::date(2026, 11, 17));
 
         // Act
-        let days = m.history_in(&tz, Period::Day, from, to, Some(id), false).unwrap();
-        let hours = m.history_in(&tz, Period::Hour, to, to, Some(id), false).unwrap();
-        let weeks = m.history_in(&tz, Period::Week, from, to, Some(id), false).unwrap();
+        let days = m.history_in(&tz, Period::Day, from, to, Some(id), None, false).unwrap();
+        let hours = m.history_in(&tz, Period::Hour, to, to, Some(id), None, false).unwrap();
+        let weeks = m.history_in(&tz, Period::Week, from, to, Some(id), None, false).unwrap();
 
         // Assert
         assert_eq!(
@@ -1269,7 +1309,7 @@ mod tests {
         let tz = TimeZone::get("Asia/Shanghai").unwrap();
 
         // Act
-        let result = m.history_in(&tz, Period::Hour, jiff::civil::date(2026, 1, 1), jiff::civil::date(2026, 6, 1), None, false);
+        let result = m.history_in(&tz, Period::Hour, jiff::civil::date(2026, 1, 1), jiff::civil::date(2026, 6, 1), None, None, false);
 
         // Assert
         assert!(result.is_err());
@@ -1283,6 +1323,7 @@ mod tests {
         let at = noon().timestamp().as_second();
         let dims = |outbound: &str, sub: &str, process: &str, host: &str| Dims {
             outbound: outbound.into(),
+            route: split::route_of(outbound, &OutboundTypes::new()).key().into(),
             subscription: sub.into(),
             process: process.into(),
             inbound: "DEFAULT-MIXED".into(),
@@ -1301,6 +1342,9 @@ mod tests {
 
         // Act
         let (outbound, subscription, process) = (rank(DimKind::Outbound), rank(DimKind::Subscription), rank(DimKind::Process));
+        let route = rank(DimKind::Route);
+        let today_of = |r| m.overview_at(&noon(), Some(id), r, false).unwrap().today.down;
+        let (all, proxied, direct) = (today_of(None), today_of(Some(Route::Proxy)), today_of(Some(Route::Direct)));
         m.flush().unwrap();
         let after = rank(DimKind::Outbound);
         let chrome = m.hosts(today, today, Some(id), Some("Chrome"), None, HostView::Host, 10).unwrap();
@@ -1314,6 +1358,8 @@ mod tests {
         assert_eq!(outbound, vec![("HK 01".into(), 700), ("DIRECT".into(), 200), ("".into(), 100)]);
         assert_eq!(subscription, vec![("白月光".into(), 700), (split::DIRECT.into(), 200), ("".into(), 100)]);
         assert_eq!(process, vec![("Chrome".into(), 700), ("Mail".into(), 200), ("".into(), 100)]);
+        assert_eq!(route, vec![("proxy".into(), 700), ("direct".into(), 200), ("".into(), 100)]);
+        assert_eq!((all, proxied, direct), (1_000, 700, 200));
         assert_eq!(after, outbound);
         assert_eq!(chrome.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("www.youtube.com", 600), ("i.ytimg.com", 100)]);
         assert_eq!(merged.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("youtube.com", 600), ("", 300)]);
@@ -1346,7 +1392,7 @@ mod tests {
             let rules = m.attributor().unwrap();
             let conns: Vec<(Dims, Bytes)> = [conn("", "api.example.com", 300), conn("curl", "example.org", 100)]
                 .iter()
-                .map(|c| (split::dims_of(c, None, &rules), c.bytes))
+                .map(|c| (split::dims_of(c, None, &rules, &OutboundTypes::new()), c.bytes))
                 .collect();
             m.account("a", id, None, Some(Bytes::new(0, prev)), Bytes::new(0, total), &conns, at + total as i64);
         };
@@ -1398,6 +1444,7 @@ mod tests {
         let now = noon().timestamp().as_second();
         let dims = |sub: &str| Dims {
             outbound: "HK".into(),
+            route: Route::Proxy.key().into(),
             subscription: sub.into(),
             process: String::new(),
             inbound: String::new(),
@@ -1470,7 +1517,7 @@ mod tests {
         again.record("a", id, Some(&core), None, Reading { totals: Bytes::new(130, 400), rate: Bytes::ZERO, at: now + 60 }).unwrap();
 
         // Assert
-        assert_eq!(again.overview_at(&noon(), Some(id), false).unwrap().today, Bytes::new(30, 300));
+        assert_eq!(again.overview_at(&noon(), Some(id), None, false).unwrap().today, Bytes::new(30, 300));
     }
 
     #[test]

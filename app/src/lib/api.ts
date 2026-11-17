@@ -76,6 +76,9 @@ export interface Bounds {
 
 export type DimKind = "outbound" | "subscription" | "process" | "inbound";
 
+/** Through a proxy or not. Traffic no connection accounts for has no route; `null` asks for all traffic. */
+export type Route = "proxy" | "direct";
+
 /** One key of a ranking. The empty key is traffic that could not be attributed, or for hosts the many small ones folded together. */
 export interface RankRow extends Bytes {
   key: string;
@@ -234,9 +237,12 @@ export const api = {
   listSources: () => invoke<Source[]>("list_sources"),
   addManualSource: (name: string, url: string, secret: string) => invoke<void>("add_manual_source", { name, url, secret }),
   removeManualSource: (url: string) => invoke<void>("remove_manual_source", { url }),
-  overview: (source: number | null) => invoke<Overview>("overview", { source }),
+  overview: (source: number | null, route: Route | null) => invoke<Overview>("overview", { source, route }),
   live: (source: number | null) => invoke<LivePoint[]>("live", { source }),
-  history: (unit: PeriodUnit, from: string, to: string, source: number | null) => invoke<PeriodRow[]>("history", { unit, from, to, source }),
+  history: (unit: PeriodUnit, from: string, to: string, source: number | null, route: Route | null) =>
+    invoke<PeriodRow[]>("history", { unit, from, to, source, route }),
+  /** Traffic of the local days `from` through `to` by route; the empty key is what has none. */
+  routes: (from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind: "route", from, to, source }),
   ranking: (kind: DimKind, from: string, to: string, source: number | null) => invoke<RankRow[]>("ranking", { kind, from, to, source }),
   hosts: (from: string, to: string, source: number | null, process: string | null, group: string | null, view: HostView) =>
     invoke<RankRow[]>("hosts", { from, to, source, process, group, view }),
@@ -258,7 +264,7 @@ export const api = {
   saveCycle: (cycle: CycleConfig) => invoke<number>("save_cycle", { cycle }),
   deleteCycle: (id: number) => invoke<void>("delete_cycle", { id }),
   dataBounds: (source: number | null) => invoke<Bounds | null>("data_bounds", { source }),
-  topDays: (source: number | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, limit }),
+  topDays: (source: number | null, route: Route | null, limit: number) => invoke<PeriodRow[]>("top_days", { source, route, limit }),
   /** Opens a save dialog and writes CSV or JSON; false when the user cancelled it. */
   exportFile: (name: string, content: string, csv: boolean) => invoke<boolean>("export_file", { name, content, csv }),
   releaseNotes: (after: string, upto: string) => invoke<ReleaseNote[]>("release_notes", { after, upto }),

@@ -2,11 +2,13 @@ import { ChevronLeft, ChevronRight, Download, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { StackedBars, type BarItem } from "@/components/charts";
 import { Page, PageHeader } from "@/components/PageHeader";
+import { RouteShare } from "@/components/RouteShare";
 import { Segmented } from "@/components/Segmented";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type Bounds, type PeriodRow, type PeriodUnit, type Source } from "@/lib/api";
+import { ROUTE_FILTERS, ROUTE_LABEL, routeOf, useRouteFilter } from "@/lib/route";
 import { bytes, cn, isoDate, parseDate, rate } from "@/lib/utils";
 
 type View = PeriodUnit | "top" | "custom";
@@ -100,6 +102,7 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
   const [anchor, setAnchor] = useState<Date>(today);
   const [custom, setCustom] = useState(() => ({ from: isoDate(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 29)), to: isoDate(today) }));
   const [source, setSource] = useState<number | null>(null);
+  const [route, setRoute] = useRouteFilter();
   const [bounds, setBounds] = useState<Bounds | null>(null);
   const [rows, setRows] = useState<PeriodRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,14 +118,15 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
   const load = useCallback(async () => {
     try {
       setBounds(await api.dataBounds(source));
-      if (view === "top") setRows(await api.topDays(source, TOP_N));
-      else if (view === "custom") setRows(from <= to ? await api.history("day", from, to, source) : []);
-      else setRows(await api.history(view, from, to, source));
+      const r = routeOf(route);
+      if (view === "top") setRows(await api.topDays(source, r, TOP_N));
+      else if (view === "custom") setRows(from <= to ? await api.history("day", from, to, source, r) : []);
+      else setRows(await api.history(view, from, to, source, r));
       setError(null);
     } catch (e) {
       setError(errorText(e));
     }
-  }, [view, from, to, source]);
+  }, [view, from, to, source, route]);
 
   useEffect(() => {
     void load();
@@ -148,7 +152,8 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
     const what = VIEWS.find(([v]) => v === view)?.[1] ?? view;
     const span = view === "top" ? `前${TOP_N}天` : from === to ? from : `${from}_${to}`;
     try {
-      if (await api.exportFile(`mihomo-monitor-${what}-${span}.csv`, csv(rows, now), true)) toast("已导出");
+      const scope = route === "all" ? "" : `-${ROUTE_LABEL[route]}`;
+      if (await api.exportFile(`mihomo-monitor-${what}${scope}-${span}.csv`, csv(rows, now), true)) toast("已导出");
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
@@ -163,6 +168,7 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
         subtitle="按小时、日、周、月、年翻看任意时段的流量，对应 vnstat 的 -h / -d / -w / -m / -y / -t。"
         actions={
           <>
+            <Segmented label="流量范围" value={route} onChange={setRoute} options={ROUTE_FILTERS} />
             {recorded.length > 1 && (
               <Select
                 aria-label="查看的内核"
@@ -233,6 +239,11 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
               )}
               {bounds && <span className="ml-auto">记录自 {bounds.first}</span>}
             </div>
+            {view !== "top" && from <= to && (
+              <div className="-mt-1.5 mb-3">
+                <RouteShare from={from} to={to} source={source} filter={route} version={rows} />
+              </div>
+            )}
             {view !== "top" && <StackedBars items={bars} tableToggle={false} ariaLabel={`${win?.title ?? `${from} 至 ${to}`}的下载与上传流量`} />}
             <PeriodTable rows={shownRows} ranked={view === "top"} now={now} loading={rows === null} />
           </div>

@@ -10,12 +10,16 @@ use crate::domain::counter::{Bytes, Checkpoint, CoreId};
 use crate::domain::cycle::{CountMode, Reset};
 use crate::domain::hostgroup::{Rule, RuleKind};
 use crate::domain::period::Range;
-use crate::domain::split::DimKind;
+use crate::domain::split::{DimKind, Route};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
+
+/// The rows that make up a total, with the route (`?3`) as a filter: all traffic is the outbound
+/// rows, which add up to the total; one route is its route rows.
+const SCOPE: &str = "((?3 IS NULL AND d.kind = 'outbound') OR (d.kind = 'route' AND d.key = ?3))";
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -105,6 +109,23 @@ CREATE TABLE attribution_rules (
     priority INTEGER NOT NULL,
     enabled INTEGER NOT NULL
 );
+";
+
+/// Through a proxy or not, as a dimension of its own. Traffic recorded before it is converted from
+/// the outbound rows by mihomo's built-in names (DIRECT, REJECT…, PASS are direct), the only way
+/// to tell without the outbound types the core reports now; the unattributed remainder stays
+/// without a route.
+const SCHEMA_V6: &str = "
+INSERT OR IGNORE INTO dims (kind, key) VALUES ('route', 'proxy'), ('route', 'direct'), ('route', '');
+INSERT INTO traffic (source_id, bucket, dim_id, up, down)
+SELECT t.source_id, t.bucket, r.id, SUM(t.up), SUM(t.down)
+FROM traffic t
+JOIN dims o ON o.id = t.dim_id AND o.kind = 'outbound'
+JOIN dims r ON r.kind = 'route' AND r.key = CASE
+    WHEN o.key = '' THEN ''
+    WHEN o.key = 'DIRECT' OR o.key = 'PASS' OR o.key LIKE 'REJECT%' THEN 'direct'
+    ELSE 'proxy' END
+GROUP BY t.source_id, t.bucket, r.id;
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -435,34 +456,39 @@ impl Store {
             .map_err(err)
     }
 
-    /// Total traffic per source in `range`; sources without traffic are left out.
-    pub fn sums_by_source(&self, range: Range) -> Result<Vec<(i64, Bytes)>, String> {
+    /// Traffic per source in `range`, all of it or only that of one route; sources without
+    /// traffic are left out.
+    pub fn sums_by_source(&self, range: Range, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT t.source_id, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
-                 WHERE d.kind = 'outbound' AND t.bucket >= ?1 AND t.bucket < ?2
-                 GROUP BY t.source_id",
-            )
+                 WHERE {SCOPE} AND t.bucket >= ?1 AND t.bucket < ?2
+                 GROUP BY t.source_id"
+            ))
             .map_err(err)?;
-        let rows = stmt.query_map(params![range.start, range.end], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
+        let rows =
+            stmt.query_map(params![range.start, range.end, route.map(Route::key)], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
 
-    /// Per-bucket totals in `range`, oldest first; empty buckets are left out.
-    pub fn buckets(&self, range: Range, source: Option<i64>) -> Result<Vec<(i64, Bytes)>, String> {
+    /// Per-bucket traffic in `range`, all of it or only that of one route, oldest first; empty
+    /// buckets are left out.
+    pub fn buckets(&self, range: Range, source: Option<i64>, route: Option<Route>) -> Result<Vec<(i64, Bytes)>, String> {
         let mut stmt = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT t.bucket, SUM(t.up), SUM(t.down)
                  FROM traffic t JOIN dims d ON d.id = t.dim_id
-                 WHERE d.kind = 'outbound' AND t.bucket >= ?1 AND t.bucket < ?2
-                   AND (?3 IS NULL OR t.source_id = ?3)
-                 GROUP BY t.bucket ORDER BY t.bucket",
-            )
+                 WHERE {SCOPE} AND t.bucket >= ?1 AND t.bucket < ?2
+                   AND (?4 IS NULL OR t.source_id = ?4)
+                 GROUP BY t.bucket ORDER BY t.bucket"
+            ))
             .map_err(err)?;
-        let rows = stmt.query_map(params![range.start, range.end, source], |r| Ok((r.get(0)?, bytes_at(r, 1)?))).map_err(err)?;
+        let rows = stmt
+            .query_map(params![range.start, range.end, route.map(Route::key), source], |r| Ok((r.get(0)?, bytes_at(r, 1)?)))
+            .map_err(err)?;
         rows.collect::<Result<_, _>>().map_err(err)
     }
     pub fn cycles(&self) -> Result<Vec<CycleRow>, String> {
@@ -720,6 +746,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if version < 5 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V5} PRAGMA user_version = 5; COMMIT;")).map_err(err)?;
     }
+    if version < 6 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;")).map_err(err)?;
+    }
     Ok(())
 }
 
@@ -758,6 +787,28 @@ mod tests {
     }
 
     #[test]
+    fn traffic_from_before_routes_is_given_one_by_its_outbound() {
+        // Arrange: outbound rows only, as written before the route dimension existed.
+        let mut store = Store::open_in_memory();
+        let s = store.ensure_source("a", "A", 0).unwrap();
+        let out =
+            |key: &str, down| BucketDelta { source: s, bucket: 0, kind: DimKind::Outbound, key: key.into(), bytes: Bytes::new(0, down) };
+        store.commit(&[out("HK 01", 600), out("DIRECT", 200), out("REJECT-DROP", 5), out("", 100), out("JP 02", 50)], &[], &[]).unwrap();
+        let all = Range { start: 0, end: B };
+
+        // Act
+        store.conn.execute_batch(SCHEMA_V6).unwrap();
+        let routes = store.ranking(DimKind::Route, all, None).unwrap();
+        let proxied = store.buckets(all, None, Some(Route::Proxy)).unwrap();
+        let total = store.buckets(all, None, None).unwrap();
+
+        // Assert
+        assert_eq!(routes.iter().map(|(k, b)| (k.as_str(), b.down)).collect::<Vec<_>>(), [("proxy", 650), ("direct", 205), ("", 100)]);
+        assert_eq!(proxied, vec![(0, Bytes::new(0, 650))]);
+        assert_eq!(total, vec![(0, Bytes::new(0, 955))]);
+    }
+
+    #[test]
     fn commits_add_up_within_a_bucket() {
         // Arrange
         let mut store = Store::open_in_memory();
@@ -768,7 +819,10 @@ mod tests {
         store.commit(&[delta(s, 0, 5, 50), delta(s, B, 1, 1)], &[], &[]).unwrap();
 
         // Assert
-        assert_eq!(store.buckets(Range { start: 0, end: 2 * B }, Some(s)).unwrap(), vec![(0, Bytes::new(15, 150)), (B, Bytes::new(1, 1))]);
+        assert_eq!(
+            store.buckets(Range { start: 0, end: 2 * B }, Some(s), None).unwrap(),
+            vec![(0, Bytes::new(15, 150)), (B, Bytes::new(1, 1))]
+        );
     }
 
     #[test]

@@ -74,6 +74,13 @@ def providers():
     }
 
 
+def proxies():
+    """`/proxies`, trimmed to what Mihomo-Monitor reads: each outbound's type."""
+    out = {"DIRECT": {"type": "Direct"}, "REJECT": {"type": "Reject"}, "节点选择": {"type": "Selector"}}
+    out.update({name: {"type": "Shadowsocks"} for name, _, _ in NODES})
+    return {"proxies": out}
+
+
 def pick(options, weight):
     """A random option, chosen in proportion to `weight(option)`."""
     r = random.random() * sum(weight(o) for o in options)
@@ -188,6 +195,8 @@ def handler_for(core: Core, secret: str):
                 self._json(VERSION)
             elif self.path.startswith("/connections"):
                 self._json(core.connections())
+            elif self.path == "/proxies":
+                self._json(proxies())
             elif self.path.startswith("/providers/proxies"):
                 self._json(providers())
             elif self.path.startswith("/traffic"):

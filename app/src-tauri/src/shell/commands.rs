@@ -4,7 +4,7 @@ use super::tray;
 use crate::domain::attribution::AttributionRule;
 use crate::domain::hostgroup::RuleKind;
 use crate::domain::period::Period;
-use crate::domain::split::DimKind;
+use crate::domain::split::{DimKind, Route};
 use crate::infra::discovery::controller_url;
 use crate::infra::import::{Entry, Format, Parsed};
 use crate::infra::paths;
@@ -118,8 +118,8 @@ pub fn remove_manual_source(monitor: Mon, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn overview(monitor: Mon, source: Option<i64>) -> Result<Overview, String> {
-    monitor.overview(source, settings::load().week_starts_sunday)
+pub fn overview(monitor: Mon, source: Option<i64>, route: Option<Route>) -> Result<Overview, String> {
+    monitor.overview(source, route, settings::load().week_starts_sunday)
 }
 
 fn date(s: &str) -> Result<jiff::civil::Date, String> {
@@ -127,8 +127,15 @@ fn date(s: &str) -> Result<jiff::civil::Date, String> {
 }
 
 #[tauri::command]
-pub fn history(monitor: Mon, unit: Period, from: String, to: String, source: Option<i64>) -> Result<Vec<PeriodRow>, String> {
-    monitor.history(unit, date(&from)?, date(&to)?, source, settings::load().week_starts_sunday)
+pub fn history(
+    monitor: Mon,
+    unit: Period,
+    from: String,
+    to: String,
+    source: Option<i64>,
+    route: Option<Route>,
+) -> Result<Vec<PeriodRow>, String> {
+    monitor.history(unit, date(&from)?, date(&to)?, source, route, settings::load().week_starts_sunday)
 }
 
 #[tauri::command]
@@ -236,8 +243,8 @@ pub fn data_bounds(monitor: Mon, source: Option<i64>) -> Result<Option<Bounds>, 
 }
 
 #[tauri::command]
-pub fn top_days(monitor: Mon, source: Option<i64>, limit: usize) -> Result<Vec<PeriodRow>, String> {
-    monitor.top_days(source, limit.min(100))
+pub fn top_days(monitor: Mon, source: Option<i64>, route: Option<Route>, limit: usize) -> Result<Vec<PeriodRow>, String> {
+    monitor.top_days(source, route, limit.min(100))
 }
 
 /// Asks where to save and writes the text there, as CSV or JSON. The page hands over only the

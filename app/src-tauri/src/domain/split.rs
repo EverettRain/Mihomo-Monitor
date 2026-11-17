@@ -1,10 +1,12 @@
-//! Splitting traffic by where it went: outbound node, subscription, process, inbound, host.
+//! Splitting traffic by where it went: outbound node, route (through a proxy or not),
+//! subscription, process, inbound, host.
 //!
 //! mihomo lists the open connections with their own byte counters. Between two snapshots a
 //! connection's growth is attributed to its dimensions. Connections that closed in between take
 //! their last bytes with them, so the core's total grows by more than the connections we saw;
-//! that remainder is "unattributed" (the empty key). The outbound split always adds up to the
-//! total; the other dimensions keep only what they know, and the views derive their remainder.
+//! that remainder is "unattributed" (the empty key). The outbound and route splits always add up
+//! to the total; the other dimensions keep only what they know, and the views derive their
+//! remainder.
 //! A connection without a value for a dimension is kept under that dimension's empty key: for
 //! processes, that is traffic the core saw but could not tie to a program, apart from the
 //! remainder no connection accounts for.
@@ -18,17 +20,20 @@ use std::collections::HashMap;
 #[serde(rename_all = "lowercase")]
 pub enum DimKind {
     Outbound,
+    /// Through a proxy or not: keys `proxy` and `direct`.
+    Route,
     Subscription,
     Process,
     Inbound,
 }
 
 impl DimKind {
-    pub const ALL: [DimKind; 4] = [DimKind::Outbound, DimKind::Subscription, DimKind::Process, DimKind::Inbound];
+    pub const ALL: [DimKind; 5] = [DimKind::Outbound, DimKind::Route, DimKind::Subscription, DimKind::Process, DimKind::Inbound];
 
     pub fn as_str(self) -> &'static str {
         match self {
             DimKind::Outbound => "outbound",
+            DimKind::Route => "route",
             DimKind::Subscription => "subscription",
             DimKind::Process => "process",
             DimKind::Inbound => "inbound",
@@ -38,6 +43,28 @@ impl DimKind {
 
 /// Subscription key of traffic that went out directly, not through any subscription's node.
 pub const DIRECT: &str = "DIRECT";
+
+/// Whether traffic went out through a proxy. Traffic no connection accounts for has no route
+/// (the empty key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Route {
+    Proxy,
+    /// Not through a proxy: direct, or rejected.
+    Direct,
+}
+
+impl Route {
+    pub fn key(self) -> &'static str {
+        match self {
+            Route::Proxy => "proxy",
+            Route::Direct => "direct",
+        }
+    }
+}
+
+/// The type of each outbound the core has, by name, as `/proxies` reports it.
+pub type OutboundTypes = HashMap<String, String>;
 
 /// One connection as listed by `/connections`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,30 +85,65 @@ pub struct Conn {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Dims {
     pub outbound: String,
+    /// The route's key; empty when the connection has no outbound.
+    pub route: String,
     pub subscription: String,
     pub process: String,
     pub inbound: String,
     pub host: String,
 }
 
-fn is_direct(outbound: &str) -> bool {
+/// mihomo's built-in outbounds that do not go through a proxy.
+fn builtin_direct(outbound: &str) -> bool {
     outbound == "DIRECT" || outbound.starts_with("REJECT") || outbound == "PASS"
+}
+
+/// Outbound types that do not go through a proxy.
+fn direct_type(kind: &str) -> bool {
+    matches!(kind, "Direct" | "Reject" | "RejectDrop" | "Pass" | "Compatible" | "Dns")
+}
+
+/// The route of traffic out through `outbound`: by the outbound's type when the core reported
+/// it, which also catches direct outbounds of the user's own (`type: direct` with a name of
+/// their choosing); else by mihomo's built-in names.
+pub fn route_of(outbound: &str, types: &OutboundTypes) -> Route {
+    let direct = match types.get(outbound) {
+        Some(kind) => direct_type(kind),
+        None => builtin_direct(outbound),
+    };
+    if direct {
+        Route::Direct
+    } else {
+        Route::Proxy
+    }
 }
 
 /// The dimensions of a connection. Its subscription is the proxy-provider of its node when it
 /// has one; otherwise `client_subscription`, the profile the client had active (clients such as
 /// Clash Verge Rev expand a subscription into plain `proxies`, so the core never sees it). Its
 /// process is the core's, or, when the core has none, what the attribution rules name it.
-pub fn dims_of(c: &Conn, client_subscription: Option<&str>, rules: &Attributor) -> Dims {
+pub fn dims_of(c: &Conn, client_subscription: Option<&str>, rules: &Attributor, types: &OutboundTypes) -> Dims {
     let outbound = c.chains.first().cloned().unwrap_or_default();
-    let subscription = if outbound.is_empty() {
-        String::new()
-    } else if is_direct(&outbound) {
-        DIRECT.to_string()
-    } else {
-        c.provider_chains.iter().find(|p| !p.is_empty()).cloned().or_else(|| client_subscription.map(str::to_string)).unwrap_or_default()
+    let route = (!outbound.is_empty()).then(|| route_of(&outbound, types));
+    let subscription = match route {
+        None => String::new(),
+        Some(Route::Direct) => DIRECT.to_string(),
+        Some(Route::Proxy) => c
+            .provider_chains
+            .iter()
+            .find(|p| !p.is_empty())
+            .cloned()
+            .or_else(|| client_subscription.map(str::to_string))
+            .unwrap_or_default(),
     };
-    Dims { outbound, subscription, process: rules.process_of(c).to_string(), inbound: c.inbound.clone(), host: c.host.clone() }
+    Dims {
+        outbound,
+        route: route.map_or("", Route::key).to_string(),
+        subscription,
+        process: rules.process_of(c).to_string(),
+        inbound: c.inbound.clone(),
+        host: c.host.clone(),
+    }
 }
 
 /// Remembers each open connection's counters between snapshots.
@@ -136,6 +198,7 @@ pub fn split(total: Bytes, deltas: &[(Dims, Bytes)]) -> Split {
         seen += *b;
         for (kind, key) in [
             (DimKind::Outbound, &d.outbound),
+            (DimKind::Route, &d.route),
             (DimKind::Subscription, &d.subscription),
             (DimKind::Process, &d.process),
             (DimKind::Inbound, &d.inbound),
@@ -147,6 +210,7 @@ pub fn split(total: Bytes, deltas: &[(Dims, Bytes)]) -> Split {
     let rest = Bytes::new(sub(total.up, seen.up), sub(total.down, seen.down));
     if !rest.is_zero() {
         *s.dims.entry((DimKind::Outbound, String::new())).or_default() += rest;
+        *s.dims.entry((DimKind::Route, String::new())).or_default() += rest;
     }
     s.dims.retain(|_, v| !v.is_zero());
     s
@@ -183,7 +247,7 @@ mod tests {
         let c = conn("1", 0, 0, &["🇺🇸 美国 xtls-reality", "US-Global", "US-Workstation"]);
 
         // Act
-        let d = dims_of(&c, Some("白月光"), &Attributor::default());
+        let d = dims_of(&c, Some("白月光"), &Attributor::default(), &OutboundTypes::new());
 
         // Assert
         assert_eq!(d.outbound, "🇺🇸 美国 xtls-reality");
@@ -197,7 +261,7 @@ mod tests {
         c.provider_chains = vec!["机场A".into(), String::new()];
 
         // Act
-        let d = dims_of(&c, Some("白月光"), &Attributor::default());
+        let d = dims_of(&c, Some("白月光"), &Attributor::default(), &OutboundTypes::new());
 
         // Assert
         assert_eq!(d.subscription, "机场A");
@@ -207,7 +271,7 @@ mod tests {
     fn direct_traffic_belongs_to_no_subscription() {
         // Act
         let d = [&["DIRECT"][..], &["REJECT-DROP"], &[]]
-            .map(|chains| dims_of(&conn("1", 0, 0, chains), Some("白月光"), &Attributor::default()).subscription);
+            .map(|chains| dims_of(&conn("1", 0, 0, chains), Some("白月光"), &Attributor::default(), &OutboundTypes::new()).subscription);
 
         // Assert
         assert_eq!(d, [DIRECT.to_string(), DIRECT.to_string(), String::new()]);
@@ -246,8 +310,8 @@ mod tests {
     #[test]
     fn the_outbound_split_adds_up_to_the_total() {
         // Arrange
-        let hk = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), Some("白月光"), &Attributor::default());
-        let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), Some("白月光"), &Attributor::default());
+        let hk = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), Some("白月光"), &Attributor::default(), &OutboundTypes::new());
+        let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), Some("白月光"), &Attributor::default(), &OutboundTypes::new());
 
         // Act
         let s = split(Bytes::new(100, 1_000), &[(hk, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
@@ -282,8 +346,9 @@ mod tests {
         ];
         let grown = [Bytes::new(10, 100), Bytes::new(20, 300), Bytes::new(5, 50)];
         let total = Bytes::new(40, 500);
-        let by =
-            |rules: &Attributor| -> Vec<(Dims, Bytes)> { conns.iter().zip(grown).map(|(c, b)| (dims_of(c, None, rules), b)).collect() };
+        let by = |rules: &Attributor| -> Vec<(Dims, Bytes)> {
+            conns.iter().zip(grown).map(|(c, b)| (dims_of(c, None, rules, &OutboundTypes::new()), b)).collect()
+        };
         let sum = |s: &Split, kind: DimKind| s.dims.iter().filter(|((k, _), _)| *k == kind).fold(Bytes::ZERO, |a, (_, v)| a + *v);
 
         // Act
@@ -302,6 +367,56 @@ mod tests {
         let hosts = |s: &Split| s.hosts.values().fold(Bytes::ZERO, |a, v| a + *v);
         assert_eq!(hosts(&named), hosts(&plain));
         assert_eq!(named.hosts[&("Container: us-workstation".into(), "example.com".into())], Bytes::new(20, 300));
+    }
+
+    #[test]
+    fn the_core_reported_type_decides_the_route() {
+        // Arrange: a direct outbound of the user's own, a built-in one, and a node, with and
+        // without the types from `/proxies`.
+        let types: OutboundTypes = [("直连-以太网", "Direct"), ("HK 01", "Shadowsocks"), ("广告拦截", "Reject")]
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .into();
+        let names = ["直连-以太网", "DIRECT", "REJECT-DROP", "HK 01", "广告拦截"];
+
+        // Act
+        let known = names.map(|n| route_of(n, &types));
+        let unknown = names.map(|n| route_of(n, &OutboundTypes::new()));
+
+        // Assert
+        assert_eq!(known, [Route::Direct, Route::Direct, Route::Direct, Route::Proxy, Route::Direct]);
+        assert_eq!(unknown, [Route::Proxy, Route::Direct, Route::Direct, Route::Proxy, Route::Proxy]);
+    }
+
+    #[test]
+    fn a_direct_outbound_of_the_users_own_belongs_to_no_subscription() {
+        // Arrange
+        let types: OutboundTypes = [("直连-以太网".to_string(), "Direct".to_string())].into();
+        let c = conn("1", 0, 0, &["直连-以太网"]);
+
+        // Act
+        let d = dims_of(&c, Some("白月光"), &Attributor::default(), &types);
+
+        // Assert
+        assert_eq!((d.route.as_str(), d.subscription.as_str()), ("direct", DIRECT));
+    }
+
+    #[test]
+    fn the_route_split_adds_up_to_the_total_like_the_outbound_one() {
+        // Arrange
+        let none = OutboundTypes::new();
+        let proxied = dims_of(&conn("1", 0, 0, &["HK", "Proxy"]), None, &Attributor::default(), &none);
+        let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), None, &Attributor::default(), &none);
+        let total = Bytes::new(100, 1_000);
+
+        // Act
+        let s = split(total, &[(proxied, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
+
+        // Assert
+        let route: Bytes = s.dims.iter().filter(|((k, _), _)| *k == DimKind::Route).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+        assert_eq!(route, total);
+        assert_eq!(s.dims[&(DimKind::Route, "proxy".into())], Bytes::new(30, 600));
+        assert_eq!(s.dims[&(DimKind::Route, "direct".into())], Bytes::new(10, 100));
+        assert_eq!(s.dims[&(DimKind::Route, String::new())], Bytes::new(60, 300));
     }
 
     #[test]

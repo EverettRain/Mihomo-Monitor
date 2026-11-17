@@ -3,6 +3,7 @@ import { ChartColumn, Cpu } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveChart, SERIES, StackedBars, type BarItem, type RatePoint } from "@/components/charts";
 import { Heatmap } from "@/components/Heatmap";
+import { RouteShare } from "@/components/RouteShare";
 import { Segmented } from "@/components/Segmented";
 import { Group, Page, PageHeader } from "@/components/PageHeader";
 import { Tag } from "@/components/Tag";
@@ -10,7 +11,8 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { api, errorText, type Bytes, type DayPoint, type LivePoint, type Overview, type Source, type Subscription } from "@/lib/api";
 import { meterTone, percentUsed, remaining } from "@/lib/cycle";
-import { bytes, bytesShort, cn, rate } from "@/lib/utils";
+import { ROUTE_FILTERS, routeOf, useRouteFilter } from "@/lib/route";
+import { bytes, bytesShort, cn, isoDate, rate } from "@/lib/utils";
 
 /** Seconds shown in the live chart. */
 const LIVE_WINDOW = 300;
@@ -64,6 +66,12 @@ function toSeries(points: LivePoint[], now: number): RatePoint[] {
     out.push({ at: t, up: shown ? shown.up : null, down: shown ? shown.down : null });
   }
   return out;
+}
+
+/** The last `n` local days, today included, as API dates. */
+function days(n: number): [string, string] {
+  const today = new Date();
+  return [isoDate(new Date(today.getFullYear(), today.getMonth(), today.getDate() - (n - 1))), isoDate(today)];
 }
 
 function dayBars(days: DayPoint[], n: number): BarItem[] {
@@ -140,6 +148,7 @@ export function OverviewPage({
   onOpenSubscriptions: () => void;
 }) {
   const [source, setSource] = useState<number | null>(null);
+  const [route, setRoute] = useRouteFilter();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -157,13 +166,13 @@ export function OverviewPage({
 
   const load = useCallback(async () => {
     try {
-      setOverview(await api.overview(source));
+      setOverview(await api.overview(source, routeOf(route)));
       setSubs(await api.subscriptions());
       setError(null);
     } catch (e) {
       setError(errorText(e));
     }
-  }, [source]);
+  }, [source, route]);
 
   useEffect(() => {
     void load();
@@ -232,7 +241,7 @@ export function OverviewPage({
 
   return (
     <Page>
-      <PageHeader title="概览" subtitle={subtitle} />
+      <PageHeader title="概览" subtitle={subtitle} actions={<Segmented label="流量范围" value={route} onChange={setRoute} options={ROUTE_FILTERS} />} />
       <div className="space-y-5 px-5">
         <section ref={panel} className="list-card">
           <div className="flex items-center justify-between gap-3 px-4 pt-3">
@@ -282,10 +291,17 @@ export function OverviewPage({
                 <Stat label="峰值单日" value={stats?.peak ? bytes(sum(stats.peak)) : "—"} sub={stats?.peak?.date ?? "近一年"} />
                 <Stat label="累计" value={overview ? bytes(sum(overview.allTime)) : "—"} sub={overview ? split(overview.allTime) : undefined} />
               </div>
+              <div className="-mt-1 mb-4 flex flex-wrap items-baseline gap-x-2 px-4 text-[12px] text-muted">
+                近 30 天
+                <RouteShare from={days(30)[0]} to={days(30)[1]} source={source} filter={route} version={overview} />
+              </div>
 
               <div className="px-4">
                 <div className="mb-1 flex items-center justify-between gap-3">
-                  <span className="text-[12.5px] font-medium text-fg-2">实时速率</span>
+                  <span className="text-[12.5px] font-medium text-fg-2">
+                    实时速率
+                    {route !== "all" && <span className="ml-1.5 text-[11.5px] font-normal text-muted">全部流量，实时速率无法按是否经代理区分</span>}
+                  </span>
                   <div className="flex items-center gap-4 text-[11.5px]">
                     {SERIES.map((s) => (
                       <span key={s.key} className="inline-flex items-center gap-1.5">
@@ -306,13 +322,19 @@ export function OverviewPage({
               </div>
 
               <div className="px-4 pb-4 pt-5">
-                <div className="mb-2 text-[12.5px] font-medium text-fg-2">流量活动</div>
+                <div className="mb-2 text-[12.5px] font-medium text-fg-2">
+                  流量活动
+                  {route !== "all" && <span className="ml-1.5 text-[11.5px] font-normal text-muted">开始按连接统计之前的流量分不出是否经代理，不计入</span>}
+                </div>
                 {overview && <Heatmap days={overview.days} weekStartsSunday={weekStartsSunday} />}
               </div>
             </>
           ) : (
             <div className="border-t-0 px-4 pb-4 pt-3">
               <StackedBars items={bars} ariaLabel={range === "today" ? "今天每小时的下载与上传流量" : `近 ${range} 天每天的下载与上传流量`} />
+              <div className="mt-2">
+                <RouteShare from={days(range === "today" ? 1 : range)[0]} to={days(range === "today" ? 1 : range)[1]} source={source} filter={route} version={overview} />
+              </div>
             </div>
           )}
         </section>

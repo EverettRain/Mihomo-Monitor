@@ -49,6 +49,8 @@ def main():
         return db.execute("SELECT id FROM dims WHERE kind = ? AND key = ?", (kind, key)).fetchone()[0]
 
     unattributed = dim("outbound", "")
+    # Traffic no connection accounts for has no route either.
+    no_route = dim("route", "")
     # Each program as the app records it: a rule names what the core could not.
     named = {inbound: name for name, inbound, _, on in RULES if on}
     programs = []
@@ -60,6 +62,7 @@ def main():
     inbounds = [(name, shared * w) for name, w in fake.INBOUNDS] + [(inbound, w) for _, w, _, inbound in programs if inbound]
     shares = {
         "outbound": [(n, (1 - direct_share) * w) for n, _, w in fake.NODES] + [("DIRECT", direct_share)],
+        "route": [("proxy", 1 - direct_share), ("direct", direct_share)],
         "subscription": [("白月光", (1 - direct_share) * 0.8), ("备用机场", (1 - direct_share) * 0.2), ("DIRECT", direct_share)],
         "process": [(name, w) for name, w, _, _ in programs],
         "inbound": inbounds,
@@ -92,9 +95,11 @@ def main():
             day_down += down
             if back >= SPLIT_DAYS:
                 rows.append((source, bucket, unattributed, up, down))
+                rows.append((source, bucket, no_route, up, down))
                 continue
             seen = 1 - fake.UNSEEN
             rows.append((source, bucket, unattributed, int(up * fake.UNSEEN), int(down * fake.UNSEEN)))
+            rows.append((source, bucket, no_route, int(up * fake.UNSEEN), int(down * fake.UNSEEN)))
             for kind, opts in shares.items():
                 total = sum(w for _, w in opts)
                 for key, w in opts:
