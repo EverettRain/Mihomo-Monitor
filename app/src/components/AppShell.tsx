@@ -78,6 +78,12 @@ export function AppShell({ activePage, onPageChange, theme, onThemeChange, statu
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : SunMoon;
   const refs = useRef<Partial<Record<PageId, HTMLButtonElement | null>>>({});
   const nav = useRef<HTMLDivElement>(null);
+  // Pages stay mounted when hidden but share this scroll area: each keeps its own place.
+  const scroller = useRef<HTMLElement>(null);
+  const scrolled = useRef<Partial<Record<PageId, number>>>({});
+  useLayoutEffect(() => {
+    if (scroller.current) scroller.current.scrollTop = scrolled.current[activePage] ?? 0;
+  }, [activePage]);
   const [thumb, setThumb] = useState<number | null>(null);
 
   // Sliding highlight behind the active row.
@@ -139,7 +145,13 @@ export function AppShell({ activePage, onPageChange, theme, onThemeChange, statu
             {!isMac && <WindowControls />}
           </div>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto">{children}</main>
+        <main
+          ref={scroller}
+          onScroll={(e) => (scrolled.current[activePage] = e.currentTarget.scrollTop)}
+          className="min-h-0 flex-1 overflow-y-auto"
+        >
+          {children}
+        </main>
       </div>
     </div>
   );

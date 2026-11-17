@@ -203,6 +203,11 @@ cycles      (id, subscription, anchor, quota_bytes, count_mode, alerts)
 - 在读取连接、拆分之前应用，所以只影响之后的采样；已记录的数据不改写，规则改名或删除后旧记录保留当时的名称。只替换进程这个键，不改变任何字节数：各维度与总量在分类前后一致（`split` 与 `monitor` 测试覆盖）。
 - 存储：v5 迁移新增 `attribution_rules`。规则变化后，内存里缓存的规则失效重建。
 
+## 7.4 界面响应（新增需求）
+
+- 查询类命令（概览、历史、排行、域名、路由、订阅、分组与规则的读取等）声明为 `async`，在 `spawn_blocking` 里执行：Tauri 里不带 `async` 的命令跑在主线程上，查询期间窗口和点击都会卡住。
+- 页面打开过一次后保持挂载，切走时只隐藏（`PageSlot`）：再切回来立刻显示上次的内容，同时在后台重新读取（`useOnShow`）。隐藏的页面暂停自己的定时刷新、实时曲线订阅和快捷键（`usePageActive`）。各页共用一个滚动区，按页面记住滚动位置。
+
 ## 8. 代码结构
 
 沿用 Hydra 的工程骨架（pnpm + Vite + React + Tailwind + lucide，GitHub Actions 发布与 updater），Rust 侧按层分目录：

@@ -128,8 +128,18 @@ pub fn remove_manual_source(monitor: Mon, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn overview(monitor: Mon, source: Option<i64>, route: Option<Route>) -> Result<Overview, String> {
-    monitor.overview(source, route, settings::load().week_starts_sunday)
+pub async fn overview(monitor: Mon<'_>, source: Option<i64>, route: Option<Route>) -> Result<Overview, String> {
+    off_main(monitor, move |m| m.overview(source, route, settings::load().week_starts_sunday)).await
+}
+
+/// Runs a query off the main thread. Commands that are not `async` run on it, so a long query
+/// would freeze the window, the click that asked for it included.
+async fn off_main<T: Send + 'static>(
+    monitor: Mon<'_>,
+    query: impl FnOnce(&Monitor) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let monitor = monitor.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || query(&monitor)).await.map_err(|e| e.to_string())?
 }
 
 fn date(s: &str) -> Result<jiff::civil::Date, String> {
@@ -137,45 +147,45 @@ fn date(s: &str) -> Result<jiff::civil::Date, String> {
 }
 
 #[tauri::command]
-pub fn history(
-    monitor: Mon,
+pub async fn history(
+    monitor: Mon<'_>,
     unit: Period,
     from: String,
     to: String,
     source: Option<i64>,
     route: Option<Route>,
 ) -> Result<Vec<PeriodRow>, String> {
-    monitor.history(unit, date(&from)?, date(&to)?, source, route, settings::load().week_starts_sunday)
+    off_main(monitor, move |m| m.history(unit, date(&from)?, date(&to)?, source, route, settings::load().week_starts_sunday)).await
 }
 
 #[tauri::command]
-pub fn ranking(
-    monitor: Mon,
+pub async fn ranking(
+    monitor: Mon<'_>,
     kind: DimKind,
     from: String,
     to: String,
     source: Option<i64>,
     route: Option<Route>,
 ) -> Result<Vec<RankRow>, String> {
-    monitor.ranking(kind, date(&from)?, date(&to)?, source, route)
+    off_main(monitor, move |m| m.ranking(kind, date(&from)?, date(&to)?, source, route)).await
 }
 
 /// Traffic by route over the last `minutes`.
 #[tauri::command]
-pub fn recent_routes(monitor: Mon, source: Option<i64>, minutes: i64) -> Result<Vec<RankRow>, String> {
-    monitor.recent_routes(source, minutes.clamp(15, 24 * 60), paths::now_secs())
+pub async fn recent_routes(monitor: Mon<'_>, source: Option<i64>, minutes: i64) -> Result<Vec<RankRow>, String> {
+    off_main(monitor, move |m| m.recent_routes(source, minutes.clamp(15, 24 * 60), paths::now_secs())).await
 }
 
 #[tauri::command]
-pub fn routes(monitor: Mon, from: String, to: String, source: Option<i64>) -> Result<Vec<RankRow>, String> {
-    monitor.routes(date(&from)?, date(&to)?, source)
+pub async fn routes(monitor: Mon<'_>, from: String, to: String, source: Option<i64>) -> Result<Vec<RankRow>, String> {
+    off_main(monitor, move |m| m.routes(date(&from)?, date(&to)?, source)).await
 }
 
 /// Hosts most traffic went to; `process` narrows them to one process, `group` to one host group.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn hosts(
-    monitor: Mon,
+pub async fn hosts(
+    monitor: Mon<'_>,
     from: String,
     to: String,
     source: Option<i64>,
@@ -184,12 +194,12 @@ pub fn hosts(
     group: Option<String>,
     view: HostView,
 ) -> Result<Vec<RankRow>, String> {
-    monitor.hosts(date(&from)?, date(&to)?, source, route, process.as_deref(), group.as_deref(), view, 100)
+    off_main(monitor, move |m| m.hosts(date(&from)?, date(&to)?, source, route, process.as_deref(), group.as_deref(), view, 100)).await
 }
 
 #[tauri::command]
-pub fn attribution_rules(monitor: Mon) -> Result<Vec<AttributionRule>, String> {
-    monitor.attribution_rules()
+pub async fn attribution_rules(monitor: Mon<'_>) -> Result<Vec<AttributionRule>, String> {
+    off_main(monitor, move |m| m.attribution_rules()).await
 }
 
 #[tauri::command]
@@ -203,8 +213,8 @@ pub fn delete_attribution_rule(monitor: Mon, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn host_groups(monitor: Mon) -> Result<Vec<HostGroupRow>, String> {
-    monitor.host_groups()
+pub async fn host_groups(monitor: Mon<'_>) -> Result<Vec<HostGroupRow>, String> {
+    off_main(monitor, move |m| m.host_groups()).await
 }
 
 #[tauri::command]
@@ -249,14 +259,14 @@ pub fn import_apply(monitor: Mon, entries: Vec<Entry>, default_group: String) ->
 
 /// The host groups and attribution rules as one rules file.
 #[tauri::command]
-pub fn export_rules_file(monitor: Mon) -> Result<String, String> {
-    monitor.export_rules_file()
+pub async fn export_rules_file(monitor: Mon<'_>) -> Result<String, String> {
+    off_main(monitor, move |m| m.export_rules_file()).await
 }
 
 /// What importing a rules file would change.
 #[tauri::command]
-pub fn plan_rules_file(monitor: Mon, text: String, keep_others: bool) -> Result<RulesPlan, String> {
-    monitor.plan_rules_file(&text, keep_others)
+pub async fn plan_rules_file(monitor: Mon<'_>, text: String, keep_others: bool) -> Result<RulesPlan, String> {
+    off_main(monitor, move |m| m.plan_rules_file(&text, keep_others)).await
 }
 
 #[tauri::command]
@@ -265,8 +275,8 @@ pub fn apply_rules_file(monitor: Mon, text: String, keep_others: bool) -> Result
 }
 
 #[tauri::command]
-pub fn subscriptions(monitor: Mon) -> Result<Vec<SubscriptionView>, String> {
-    monitor.subscriptions(paths::now_secs())
+pub async fn subscriptions(monitor: Mon<'_>) -> Result<Vec<SubscriptionView>, String> {
+    off_main(monitor, move |m| m.subscriptions(paths::now_secs())).await
 }
 
 #[tauri::command]
@@ -280,13 +290,13 @@ pub fn delete_cycle(monitor: Mon, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn data_bounds(monitor: Mon, source: Option<i64>) -> Result<Option<Bounds>, String> {
-    monitor.bounds(source)
+pub async fn data_bounds(monitor: Mon<'_>, source: Option<i64>) -> Result<Option<Bounds>, String> {
+    off_main(monitor, move |m| m.bounds(source)).await
 }
 
 #[tauri::command]
-pub fn top_days(monitor: Mon, source: Option<i64>, route: Option<Route>, limit: usize) -> Result<Vec<PeriodRow>, String> {
-    monitor.top_days(source, route, limit.min(100))
+pub async fn top_days(monitor: Mon<'_>, source: Option<i64>, route: Option<Route>, limit: usize) -> Result<Vec<PeriodRow>, String> {
+    off_main(monitor, move |m| m.top_days(source, route, limit.min(100))).await
 }
 
 /// Asks where to save and writes the text there, as CSV or JSON. The page hands over only the

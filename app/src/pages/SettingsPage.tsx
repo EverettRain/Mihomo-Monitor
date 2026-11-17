@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type AppInfo, type Settings } from "@/lib/api";
+import { useOnShow } from "@/lib/pageActive";
 
 const SAMPLE_CHOICES: readonly (readonly [number, string])[] = [
   [500, "0.5 秒"],
@@ -26,6 +27,7 @@ export function SettingsPage({ info }: { info: AppInfo | null }) {
     }
   }, [toast]);
 
+  useOnShow(reload);
   useEffect(() => {
     void reload();
     // The tray menu can switch lightweight mode too.

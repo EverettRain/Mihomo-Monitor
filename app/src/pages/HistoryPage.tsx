@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type Bounds, type PeriodRow, type PeriodUnit, type Source } from "@/lib/api";
+import { useOnShow } from "@/lib/pageActive";
 import { ROUTE_FILTERS, ROUTE_LABEL, routeOf, useRouteFilter } from "@/lib/route";
 import { bytes, cn, isoDate, parseDate, rate } from "@/lib/utils";
 
@@ -131,6 +132,7 @@ export function HistoryPage({ sources }: { sources: Source[] | null }) {
   useEffect(() => {
     void load();
   }, [load]);
+  useOnShow(load);
 
   const total = useMemo(() => (rows ?? []).reduce((t, r) => ({ up: t.up + r.up, down: t.down + r.down }), { up: 0, down: 0 }), [rows]);
   const shownRows = rows ?? [];

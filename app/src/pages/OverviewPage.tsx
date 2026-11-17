@@ -10,6 +10,7 @@ import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { api, errorText, type Bytes, type DayPoint, type LivePoint, type Overview, type Source, type Subscription } from "@/lib/api";
+import { usePageActive } from "@/lib/pageActive";
 import { meterTone, percentUsed, remaining } from "@/lib/cycle";
 import { ROUTE_FILTERS, routeOf, useRouteFilter } from "@/lib/route";
 import { bytes, bytesShort, cn, isoDate, rate } from "@/lib/utils";
@@ -84,10 +85,12 @@ function dayBars(days: DayPoint[], n: number): BarItem[] {
   });
 }
 
-function useLive(source: number | null) {
+function useLive(source: number | null, shown: boolean) {
   const [live, setLive] = useState<LivePoint[]>([]);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  // Hidden, it neither listens nor ticks; shown again, it reads the last minutes afresh.
   useEffect(() => {
+    if (!shown) return;
     let active = true;
     void api.live(source).then((pts) => active && setLive(pts));
     const un = listen<LivePoint>("traffic-sample", (e) => {
@@ -100,7 +103,7 @@ function useLive(source: number | null) {
       window.clearInterval(tick);
       void un.then((f) => f());
     };
-  }, [source]);
+  }, [source, shown]);
   return useMemo(() => toSeries(live, now), [live, now]);
 }
 
@@ -147,6 +150,7 @@ export function OverviewPage({
   onOpenSources: () => void;
   onOpenSubscriptions: () => void;
 }) {
+  const shown = usePageActive();
   const [source, setSource] = useState<number | null>(null);
   const [route, setRoute] = useRouteFilter();
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -175,6 +179,7 @@ export function OverviewPage({
   }, [source, route]);
 
   useEffect(() => {
+    if (!shown) return;
     void load();
     void api.getSettings().then((s) => setWeekStartsSunday(s.weekStartsSunday)).catch(() => {});
     // Totals include traffic still waiting in memory, so a short interval keeps them in step
@@ -187,9 +192,9 @@ export function OverviewPage({
       window.removeEventListener("focus", load);
       void un.then((f) => f());
     };
-  }, [load]);
+  }, [load, shown]);
 
-  const series = useLive(source);
+  const series = useLive(source, shown);
   const latest = [...series].reverse().find((p) => p.down !== null);
 
   const stats = useMemo(() => {

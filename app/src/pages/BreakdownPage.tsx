@@ -8,6 +8,7 @@ import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { api, errorText, type DimKind, type HostView, type RankRow, type Route, type Source } from "@/lib/api";
+import { useOnShow, usePageActive } from "@/lib/pageActive";
 import { ROUTE_FILL, ROUTE_FILTERS, ROUTE_LABEL, ROUTE_NOTE, routeOf, useRouteFilter, type RouteFilter, type RouteKey } from "@/lib/route";
 import { bytes, cn, isoDate } from "@/lib/utils";
 
@@ -254,6 +255,7 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
   const [all, setAll] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const [route, setRoute] = useRouteFilter();
+  const visible = usePageActive();
   const [ruleNames, setRuleNames] = useState<Set<string>>(new Set());
 
   const recorded = (sources ?? []).filter((s): s is Source & { id: number } => s.id !== null);
@@ -274,14 +276,19 @@ export function BreakdownPage({ sources }: { sources: Source[] | null }) {
     }
   }, [tab, from, to, source, view]);
 
+  // New choices start over; coming back to the page keeps what it showed while reading again.
   useEffect(() => {
     setRows(null);
     setAll(false);
     setOpen(null);
     void load();
+  }, [load]);
+  useOnShow(load);
+  useEffect(() => {
+    if (!visible) return;
     const timer = window.setInterval(load, 30_000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, visible]);
 
   const total = (rows ?? []).reduce((t, r) => t + r.up + r.down, 0);
   const max = Math.max(1, ...(rows ?? []).map((r) => r.up + r.down));

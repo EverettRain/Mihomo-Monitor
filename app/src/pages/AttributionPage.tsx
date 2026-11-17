@@ -9,6 +9,7 @@ import { Input, Label, Select } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type AttributionField, type AttributionRule } from "@/lib/api";
+import { useOnShow } from "@/lib/pageActive";
 import { isoDate } from "@/lib/utils";
 
 const FIELD_LABEL: Record<AttributionField, string> = { inbound: "入站名称" };
@@ -166,6 +167,7 @@ export function AttributionPage() {
   useEffect(() => {
     void load();
   }, [load]);
+  useOnShow(load);
 
   const toggle = async (r: AttributionRule, enabled: boolean) => {
     try {

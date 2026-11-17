@@ -5,6 +5,7 @@ import { Page, PageHeader } from "@/components/PageHeader";
 import { Tag } from "@/components/Tag";
 import { Button } from "@/components/ui/button";
 import { api, errorText, type CycleView, type Reported, type Subscription } from "@/lib/api";
+import { usePageActive } from "@/lib/pageActive";
 import { dateOf, describeReset, meterTone, percentUsed, remaining, shortTime } from "@/lib/cycle";
 import { bytes, bytesShort, cn } from "@/lib/utils";
 
@@ -86,11 +87,13 @@ export function SubscriptionsPage() {
     }
   }, []);
 
+  const shown = usePageActive();
   useEffect(() => {
+    if (!shown) return;
     void load();
     const timer = window.setInterval(load, 30_000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, shown]);
 
   return (
     <Page>

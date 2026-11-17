@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 import { AppShell, type PageId } from "@/components/AppShell";
 import { api, type AppInfo, type NewerData, type Source } from "@/lib/api";
+import { PageSlot } from "@/lib/pageActive";
 import { useTheme } from "@/lib/theme";
 import { AboutPage } from "@/pages/AboutPage";
 import { BreakdownPage } from "@/pages/BreakdownPage";
@@ -29,6 +30,12 @@ export default function App() {
 
 function Main() {
   const [page, setPage] = useState<PageId>("overview");
+  // Pages opened once stay mounted (hidden when not shown), so going back is instant.
+  const [opened, setOpened] = useState<ReadonlySet<PageId>>(() => new Set<PageId>(["overview"]));
+  const open = useCallback((p: PageId) => {
+    setOpened((o) => (o.has(p) ? o : new Set(o).add(p)));
+    setPage(p);
+  }, []);
   const [theme, setTheme] = useTheme();
   const [sources, setSources] = useState<Source[] | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
@@ -51,16 +58,27 @@ function Main() {
   const status = sources ? { online: sources.filter((s) => s.status === "online").length, known: sources.length } : null;
 
   return (
-    <AppShell activePage={page} onPageChange={setPage} theme={theme} onThemeChange={setTheme} status={status}>
-      {page === "overview" && <OverviewPage sources={sources} onOpenSources={() => setPage("sources")} onOpenSubscriptions={() => setPage("subscriptions")} />}
-      {page === "history" && <HistoryPage sources={sources} />}
-      {page === "breakdown" && <BreakdownPage sources={sources} />}
-      {page === "groups" && <GroupsPage />}
-      {page === "rules" && <AttributionPage />}
-      {page === "subscriptions" && <SubscriptionsPage />}
-      {page === "sources" && <SourcesPage sources={sources} />}
-      {page === "settings" && <SettingsPage info={info} />}
-      {page === "about" && <AboutPage info={info} />}
+    <AppShell activePage={page} onPageChange={open} theme={theme} onThemeChange={setTheme} status={status}>
+      {(
+        [
+          ["overview", <OverviewPage sources={sources} onOpenSources={() => open("sources")} onOpenSubscriptions={() => open("subscriptions")} />],
+          ["history", <HistoryPage sources={sources} />],
+          ["breakdown", <BreakdownPage sources={sources} />],
+          ["groups", <GroupsPage />],
+          ["rules", <AttributionPage />],
+          ["subscriptions", <SubscriptionsPage />],
+          ["sources", <SourcesPage sources={sources} />],
+          ["settings", <SettingsPage info={info} />],
+          ["about", <AboutPage info={info} />],
+        ] as const
+      ).map(
+        ([id, node]) =>
+          opened.has(id) && (
+            <PageSlot key={id} active={page === id}>
+              {node}
+            </PageSlot>
+          ),
+      )}
     </AppShell>
   );
 }

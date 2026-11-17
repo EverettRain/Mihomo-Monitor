@@ -9,6 +9,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type HostGroup, type HostRule, type RuleKind } from "@/lib/api";
+import { useOnShow, usePageActive } from "@/lib/pageActive";
 import { KIND_LABEL, KINDS } from "@/lib/hostgroup";
 
 /** Creates a group, or renames one and edits its note. */
@@ -151,14 +152,16 @@ function GroupEditor({
     setFilter("");
   }, [group.id]);
 
-  // Escape goes back to the list, unless a dialog is open (it closes first).
+  // Escape goes back to the list, unless a dialog is open (it closes first) or another page is shown.
+  const visible = usePageActive();
   useEffect(() => {
+    if (!visible) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !document.querySelector("[data-dialog-layer]")) onBack();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onBack]);
+  }, [onBack, visible]);
 
   const add = async () => {
     setBusy(true);
@@ -305,6 +308,7 @@ export function GroupsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+  useOnShow(load);
 
   const current = groups?.find((g) => g.id === selected) ?? null;
   const back = useCallback(() => setSelected(null), []);
