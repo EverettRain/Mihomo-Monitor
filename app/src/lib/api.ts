@@ -182,6 +182,8 @@ export const api = {
   openDataDir: () => invoke<void>("open_data_dir"),
   restartApp: () => invoke<void>("restart_app"),
   quitApp: () => invoke<void>("quit_app"),
+  /** Sends a notification now; `dev` is a development build (on macOS, sent as Terminal's). */
+  testNotification: () => invoke<{ dev: boolean }>("test_notification"),
 };
 
 export function errorText(e: unknown): string {

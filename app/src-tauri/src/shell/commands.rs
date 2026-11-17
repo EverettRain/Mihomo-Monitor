@@ -215,6 +215,21 @@ pub fn restart_app(app: AppHandle, monitor: Mon) {
     app.restart();
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestNotification {
+    /// A development build: on macOS its notifications go out as Terminal's.
+    dev: bool,
+}
+
+/// Sends a notification right away, to check that alerts can be seen at all.
+#[tauri::command]
+pub fn test_notification(app: AppHandle) -> Result<TestNotification, String> {
+    super::send_notification(&app, "Mihomo-Monitor 测试通知", "能看到这条通知，配额提醒就能正常弹出。")
+        .map_err(|e| format!("发送失败：{e}"))?;
+    Ok(TestNotification { dev: tauri::is_dev() })
+}
+
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
     app.exit(0);

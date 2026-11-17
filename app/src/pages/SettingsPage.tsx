@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { FolderOpen } from "lucide-react";
+import { BellRing, FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Group, Page, Row } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -69,6 +69,32 @@ export function SettingsPage({ info }: { info: AppInfo | null }) {
               disabled={!settings}
               onCheckedChange={(v) => void change(() => api.setWeekStartsSunday(v), { weekStartsSunday: v })}
             />
+          </Row>
+        </Group>
+
+        <Group label="通知">
+          <Row
+            label="测试通知"
+            hint="立即发一条通知，确认配额提醒能弹出来。macOS 第一次发通知时会询问是否允许；之后可在「系统设置 → 通知」里修改。"
+          >
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                void api.testNotification().then(
+                  (r) =>
+                    toast(
+                      r.dev && navigator.userAgent.includes("Mac")
+                        ? "已发送。开发版在 macOS 上以「终端」的名义发通知，没看到的话，请在「系统设置 → 通知 → 终端」里允许通知。"
+                        : "已发送。没看到的话，请检查系统设置里 Mihomo-Monitor 的通知权限和勿扰模式。",
+                    ),
+                  (e) => toast(errorText(e), "error"),
+                )
+              }
+            >
+              <BellRing />
+              发送测试通知
+            </Button>
           </Row>
         </Group>
 

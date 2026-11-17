@@ -60,9 +60,16 @@ fn notify(app: &AppHandle, a: &Alert) {
         format!("{} 本周期已用 {}%", a.subscription, a.threshold)
     };
     let body = format!("已用 {}，配额 {}，{resets} 重置。", tray::human(a.used), tray::human(a.quota));
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
-        paths::log(&format!("无法发送通知：{e}"));
+    match send_notification(app, &title, &body) {
+        Ok(()) => paths::log(&format!("已发送提醒：{title}")),
+        Err(e) => paths::log(&format!("无法发送提醒「{title}」：{e}")),
     }
+}
+
+/// Shows a system notification. Development builds are not an app bundle, so on macOS the
+/// plugin sends them in the name of Terminal, and they appear only if Terminal may notify.
+fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    app.notification().builder().title(title).body(body).show().map_err(|e| e.to_string())
 }
 
 pub fn run(start_in_tray: bool) {
@@ -106,6 +113,7 @@ pub fn run(start_in_tray: bool) {
             commands::open_release_page,
             commands::open_data_dir,
             commands::restart_app,
+            commands::test_notification,
             commands::quit_app,
         ])
         .setup(move |app| {
