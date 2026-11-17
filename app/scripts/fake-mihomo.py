@@ -5,7 +5,8 @@
     python3 app/scripts/fake-mihomo.py --port 19090 [--secret s3cret]
 
 Answers `GET /version`, streams `GET /traffic` (one JSON line per second, with the cumulative
-upTotal / downTotal) and lists made-up open connections on `GET /connections`: a few programs
+upTotal / downTotal), reports two subscriptions' usage on `GET /providers/proxies`, and lists
+made-up open connections on `GET /connections`: a few programs
 browsing, streaming and syncing through a handful of nodes from two subscriptions. Connections
 open and close over time, and some traffic belongs to connections too short-lived to be listed,
 as with a real core. Standard library only.
@@ -47,6 +48,26 @@ DIRECT_HOSTS = {"WeChat", "Steam", ""}
 INBOUNDS = [("DEFAULT-MIXED", 0.7), ("DEFAULT-TUN", 0.3)]
 # Share of the traffic carried by connections that open and close between two reads.
 UNSEEN = 0.08
+# What each subscription's provider reports: used GiB (upload, download) and allowance GiB.
+REPORTS = {"白月光": (6, 86, 200), "备用机场": (2, 16, 100)}
+GIB = 1024**3
+
+
+def providers():
+    now = time.time()
+    return {
+        "providers": {
+            name: {
+                "name": name,
+                "type": "Proxy",
+                "vehicleType": "HTTP",
+                "proxies": [],
+                "updatedAt": datetime.fromtimestamp(now - 3 * 3600, timezone.utc).isoformat(),
+                "subscriptionInfo": {"Upload": up * GIB, "Download": down * GIB, "Total": total * GIB, "Expire": int(now + 40 * 86400)},
+            }
+            for name, (up, down, total) in REPORTS.items()
+        }
+    }
 
 
 def pick(options, weight):
@@ -162,6 +183,8 @@ def handler_for(core: Core, secret: str):
                 self._json(VERSION)
             elif self.path.startswith("/connections"):
                 self._json(core.connections())
+            elif self.path.startswith("/providers/proxies"):
+                self._json(providers())
             elif self.path.startswith("/traffic"):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

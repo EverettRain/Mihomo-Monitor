@@ -168,6 +168,7 @@ press "分布" "点左侧「分布」" 0 exact
 press "近 30 天" "点右上角的「近 30 天」"
 press "进程" "点「进程」" 0 exact
 press "Google Chrome" "点「Google Chrome」展开它访问的域名"; shot breakdown
+press "订阅" "点左侧「订阅」" 0 exact;           sleep 1; shot subscriptions
 press "内核" "点左侧「内核」" 0 exact;           shot sources
 press "设置" "点左侧「设置」" 0 exact;           shot settings
 [ -n "$ORIGINAL" ] && theme "$ORIGINAL"

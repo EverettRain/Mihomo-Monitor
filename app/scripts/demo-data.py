@@ -11,6 +11,7 @@ fake-mihomo.py uses; older traffic stays unattributed, as for someone who upgrad
 version without the split. Standard library only.
 """
 
+import json
 import math
 import os
 import random
@@ -102,6 +103,12 @@ def main():
         "INSERT INTO domain_daily (source_id, day, process_dim_id, domain_dim_id, up, down) VALUES (?, ?, ?, ?, ?, ?)"
         " ON CONFLICT DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
         host_rows,
+    )
+    # A monthly cycle for the main subscription, twelve days into it.
+    reset_day = time.localtime(midnight - 12 * 86400).tm_mday
+    db.execute(
+        "INSERT OR REPLACE INTO cycles (subscription, anchor, quota_bytes, count_mode, alerts) VALUES (?, ?, ?, 'both', '[80,100]')",
+        ("白月光", json.dumps({"kind": "monthly", "day": reset_day, "hour": 0, "minute": 0}), 200 * 1024**3),
     )
     db.commit()
     print(f"added {len(rows)} traffic rows and {len(host_rows)} host rows to source {source}")
