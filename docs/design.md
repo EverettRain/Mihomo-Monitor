@@ -170,6 +170,16 @@ cycles      (id, subscription, anchor, quota_bytes, count_mode, alerts)
 - 提醒：每分钟写盘后检查一次；每个周期每个阈值只通知一次，记录在 `meta` 表（`alerted:<周期 id>:<周期开始>`）。通知用 `tauri-plugin-notification`。
 - 展示：「订阅」页（周期进度、预计周期末用量、日均、机场数据对照、设置对话框），概览页的「计费周期」进度条，托盘悬停文字。
 
+## 7.1 域名分组（新增需求）
+
+用户给域名与 IP 打组，分布页的域名可按分组合并显示。
+
+- 条目沿用 Clash 的四种匹配：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`；优先级同 Clash（精确 > 最长后缀 > 关键字；地址按最长前缀）；同一条目在多个分组时先建的分组优先。纯逻辑在 `domain/hostgroup.rs`。
+- 文本里不带前缀的域名按“域名及子域名”读，更贴近“把这个服务归一组”的用意；Clash rule-provider 与 sing-box 里则按各自的原意（裸域名为精确匹配）。
+- 导入解析在 `infra/import.rs`：文本、CSV / TSV（`csv` crate）、JSON（含 sing-box rule-set 与本应用导出格式）、YAML（Clash rule-provider）；自动识别格式；逐行报告无法识别的原因，不让整个导入失败。导入先预览、确认后在一个事务里写入。
+- 存储：v4 迁移新增 `host_groups`、`host_rules`（同一分组内条目唯一）。分组变化后，内存里编译好的匹配器失效重建。
+- 分布页“按分组”时，未命中任何分组的域名按主域名显示。
+
 ## 8. 代码结构
 
 沿用 Hydra 的工程骨架（pnpm + Vite + React + Tailwind + lucide，GitHub Actions 发布与 updater），Rust 侧按层分目录：

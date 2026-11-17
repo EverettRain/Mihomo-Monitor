@@ -110,6 +110,18 @@ def main():
         "INSERT OR REPLACE INTO cycles (subscription, anchor, quota_bytes, count_mode, alerts) VALUES (?, ?, ?, 'both', '[80,100]')",
         ("白月光", json.dumps({"kind": "monthly", "day": reset_day, "hour": 0, "minute": 0}), 200 * 1024**3),
     )
+    # A few host groups; Apple, Steam and the rest stay ungrouped.
+    groups = {
+        "YouTube": [("suffix", "youtube.com"), ("suffix", "googlevideo.com"), ("suffix", "ytimg.com")],
+        "Google": [("suffix", "google.com")],
+        "Telegram": [("suffix", "telesco.pe"), ("cidr", "149.154.160.0/20")],
+        "Spotify": [("suffix", "spotify.com"), ("domain", "audio-ak-spotify-com.akamaized.net")],
+        "开发": [("suffix", "github.com"), ("suffix", "githubusercontent.com"), ("suffix", "visualstudio.com")],
+    }
+    for name, rules in groups.items():
+        db.execute("INSERT OR IGNORE INTO host_groups (name, note, created_at) VALUES (?, '', ?)", (name, now))
+        gid = db.execute("SELECT id FROM host_groups WHERE name = ?", (name,)).fetchone()[0]
+        db.executemany("INSERT OR IGNORE INTO host_rules (group_id, kind, value) VALUES (?, ?, ?)", [(gid, k, v) for k, v in rules])
     db.commit()
     print(f"added {len(rows)} traffic rows and {len(host_rows)} host rows to source {source}")
 
