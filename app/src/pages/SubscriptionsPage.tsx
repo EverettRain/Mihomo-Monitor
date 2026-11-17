@@ -51,7 +51,7 @@ function CycleBody({ c, now }: { c: CycleView; now: number }) {
   const pct = percentUsed(c);
   const days = Math.max(1, (Math.min(now, c.end) - c.start) / 86400);
   return (
-    <div className="space-y-3 px-4 pb-3">
+    <div className="space-y-3 border-t-0 px-4 pb-3">
       <div>
         <div className="mb-1.5 flex items-baseline justify-between gap-3 text-[12px]">
           <span className="text-muted">
@@ -121,7 +121,7 @@ export function SubscriptionsPage() {
                   </div>
                   {!s.cycle && <div className="text-[11.5px] text-muted">本月 {bytes(s.month.up + s.month.down)}</div>}
                 </div>
-                <Button size="sm" variant={s.cycle ? "ghost" : "outline"} onClick={() => setEditing(s)}>
+                <Button size="sm" variant="outline" onClick={() => setEditing(s)}>
                   {s.cycle ? "修改" : "设置计费周期"}
                 </Button>
               </div>
