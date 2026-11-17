@@ -12,6 +12,7 @@
 ![macOS](https://img.shields.io/badge/macOS-11%2B-000000?style=flat-square&logo=apple)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2.x-24C8DB?style=flat-square&logo=tauri)
 ![License: MIT](https://img.shields.io/badge/License-MIT-2e7d4a?style=flat-square)
+[![Release](https://img.shields.io/github/v/release/EverettRain/Mihomo-Monitor?style=flat-square)](https://github.com/EverettRain/Mihomo-Monitor/releases/latest)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/overview-dark.png">
@@ -54,9 +55,10 @@
 
 ## 快速开始
 
-1. 安装并打开 Mihomo-Monitor。首次启动会开启开机自启，之后它在托盘（菜单栏）里运行。
-2. 打开你平时用的 Clash 客户端（例如 Clash Verge Rev）。几秒内 **内核** 页会出现这个内核，状态为「正在统计」。
-3. **概览** 页的「总览」显示今天、本周、本月、今年、近 30 天、日均、峰值单日与累计用量，最近 5 分钟的实时速率，以及一年的流量热力图；「趋势」按今天每小时或近 7 / 30 / 90 天每天显示下载与上传，悬停查看数值，也可以切换成表格。同时统计多个内核时，可以分别查看或合计。
+1. 从 [Releases](https://github.com/EverettRain/Mihomo-Monitor/releases/latest) 下载安装包：Windows 用 `Mihomo-Monitor_x.y.z_x64-setup.exe`；macOS 用 `.dmg`，Apple Silicon 选 `aarch64`，Intel 选 `x64`。macOS 版没有经过 Apple 公证，首次打开如提示“已损坏”或“无法验证开发者”，请运行 `xattr -cr /Applications/Mihomo-Monitor.app`。之后的版本可以在应用内更新。
+2. 打开 Mihomo-Monitor。首次启动会开启开机自启，之后它在托盘（菜单栏）里运行。
+3. 打开你平时用的 Clash 客户端（例如 Clash Verge Rev）。几秒内 **内核** 页会出现这个内核，状态为「正在统计」。
+4. **概览** 页的「总览」显示今天、本周、本月、今年、近 30 天、日均、峰值单日与累计用量，最近 5 分钟的实时速率，以及一年的流量热力图；「趋势」按今天每小时或近 7 / 30 / 90 天每天显示下载与上传，悬停查看数值，也可以切换成表格。同时统计多个内核时，可以分别查看或合计。
 
 第一次连接某个内核时，它此前累计的流量不会计入（和 vnstat 第一次看到网卡时一样），统计从这一刻开始。
 
@@ -253,6 +255,7 @@ app/scripts/readme-screenshots.sh
 
 ## 已知限制
 
+- macOS 版未经 Apple 签名公证；从浏览器下载后首次打开如提示“已损坏”，请运行 `xattr -cr /Applications/Mihomo-Monitor.app`。Windows 版没有代码签名，SmartScreen 提示时选「更多信息 → 仍要运行」。
 - 第一次连接某个内核时，它此前的累计流量不计入。
 - 远程内核（手动添加的地址）看不到进程，只能靠计数是否变小来判断重启：如果它在 Mihomo-Monitor 停止期间重启，并且新的计数已经超过上次记录的值，这段时间会少记。
 - 原版 Clash 与 Clash Premium 不支持，只支持 mihomo（Clash.Meta）内核。
