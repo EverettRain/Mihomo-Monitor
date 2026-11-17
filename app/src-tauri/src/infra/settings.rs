@@ -27,6 +27,21 @@ pub struct Settings {
     /// Look for cores on this machine; off, only the manual entries are read.
     pub auto_discover: bool,
     pub manual_sources: Vec<ManualSource>,
+    /// How often each core's connections are read, in milliseconds.
+    pub sample_ms: u64,
+}
+
+/// The sampling intervals offered, in milliseconds. Shorter misses fewer connections that open
+/// and close between two readings; each reading costs about 1 ms per 1000 open connections.
+pub const SAMPLE_CHOICES: [u64; 3] = [500, 1_000, 2_000];
+
+/// `ms` when it is one of the choices, else the default.
+pub fn sample_ms(ms: u64) -> u64 {
+    if SAMPLE_CHOICES.contains(&ms) {
+        ms
+    } else {
+        1_000
+    }
 }
 
 impl Default for Settings {
@@ -37,6 +52,7 @@ impl Default for Settings {
             week_starts_sunday: false,
             auto_discover: true,
             manual_sources: Vec::new(),
+            sample_ms: 1_000,
         }
     }
 }

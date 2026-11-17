@@ -61,6 +61,11 @@ impl Route {
     }
 }
 
+/// Route of traffic counted when reading resumed after a gap (the app was not running, or lost
+/// the core for a while): known from the counters alone, with no connection to tell where it
+/// went. The empty route is what slipped between two readings while reading went on.
+pub const BACKFILL: &str = "gap";
+
 /// The type of each outbound the core has, by name, as `/proxies` reports it.
 pub type OutboundTypes = HashMap<String, String>;
 
@@ -209,8 +214,16 @@ fn sub(a: u64, b: u64) -> u64 {
     a.saturating_sub(b)
 }
 
-/// Splits `total`, the core's growth over the interval, by the connections' growth.
-pub fn split(total: Bytes, deltas: &[(Dims, Bytes)]) -> Split {
+/// Splits `total`, the core's growth over the interval, by the connections' growth. The
+/// remainder goes under the empty outbound key: with the empty route while reading went on, as
+/// backfill when the interval follows a gap in reading (`resumed`).
+///
+/// The core reads its total and its connections' counters one after the other, so the
+/// connections can run a little ahead of the total; the next total catches up. What they carried
+/// beyond it is counted where it went and returned as the carry, which the caller hands to the
+/// next interval to come off its remainder first. That way the recorded traffic adds up to the
+/// core's own count over time, without stretching anything to fit.
+pub fn split(total: Bytes, deltas: &[(Dims, Bytes)], carry: Bytes, resumed: bool) -> (Split, Bytes) {
     let mut s = Split::default();
     let mut seen = Bytes::ZERO;
     for (d, b) in deltas {
@@ -225,12 +238,14 @@ pub fn split(total: Bytes, deltas: &[(Dims, Bytes)]) -> Split {
         }
         *s.hosts.entry(HostKey { process: d.process.clone(), host: d.host.clone(), route: d.route.clone() }).or_default() += *b;
     }
-    let rest = Bytes::new(sub(total.up, seen.up), sub(total.down, seen.down));
+    let owed = seen + carry;
+    let rest = Bytes::new(sub(total.up, owed.up), sub(total.down, owed.down));
+    let carry = Bytes::new(sub(owed.up, total.up), sub(owed.down, total.down));
     if !rest.is_zero() {
-        *s.dims.entry(DimKey::new(DimKind::Outbound, "", "")).or_default() += rest;
+        *s.dims.entry(DimKey::new(DimKind::Outbound, "", if resumed { BACKFILL } else { "" })).or_default() += rest;
     }
     s.dims.retain(|_, v| !v.is_zero());
-    s
+    (s, carry)
 }
 
 /// The registrable domain of a host (`a.cdn.example.co.uk` → `example.co.uk`); IP addresses and
@@ -341,7 +356,7 @@ mod tests {
         let direct = dims_of(&conn("2", 0, 0, &["DIRECT"]), Some("白月光"), &Attributor::default(), &OutboundTypes::new());
 
         // Act
-        let s = split(Bytes::new(100, 1_000), &[(hk, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
+        let (s, _) = split(Bytes::new(100, 1_000), &[(hk, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))], Bytes::ZERO, false);
 
         // Assert
         let outbound: Bytes = s.dims.iter().filter(|(k, _)| k.kind == DimKind::Outbound).fold(Bytes::ZERO, |a, (_, v)| a + *v);
@@ -379,8 +394,8 @@ mod tests {
         let sum = |s: &Split, kind: DimKind| s.dims.iter().filter(|(k, _)| k.kind == kind).fold(Bytes::ZERO, |a, (_, v)| a + *v);
 
         // Act
-        let plain = split(total, &by(&Attributor::default()));
-        let named = split(total, &by(&rules));
+        let (plain, _) = split(total, &by(&Attributor::default()), Bytes::ZERO, false);
+        let (named, _) = split(total, &by(&rules), Bytes::ZERO, false);
 
         // Assert
         assert_eq!(of(&named, DimKind::Process, "Container: us-workstation"), Bytes::new(20, 300));
@@ -437,7 +452,7 @@ mod tests {
         let total = Bytes::new(100, 1_000);
 
         // Act
-        let s = split(total, &[(proxied, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))]);
+        let (s, _) = split(total, &[(proxied, Bytes::new(30, 600)), (direct, Bytes::new(10, 100))], Bytes::ZERO, false);
 
         // Assert
         for kind in DimKind::ALL {
@@ -447,6 +462,39 @@ mod tests {
         assert_eq!(in_route(&s, DimKind::Outbound, ""), Bytes::new(60, 300));
         let hosts = |route: &str| s.hosts.iter().filter(|(k, _)| k.route == route).fold(Bytes::ZERO, |a, (_, v)| a + *v);
         assert_eq!((hosts("proxy"), hosts("direct")), (Bytes::new(30, 600), Bytes::new(10, 100)));
+    }
+
+    #[test]
+    fn connections_ahead_of_the_total_come_off_the_next_remainder() {
+        // Arrange: the first snapshot's connections ran 20 bytes ahead of its total; the next
+        // total catches up.
+        let d = dims_of(&conn("1", 0, 0, &["HK"]), None, &Attributor::default(), &OutboundTypes::new());
+        let outbound = |s: &Split| s.dims.iter().filter(|(k, _)| k.kind == DimKind::Outbound).fold(Bytes::ZERO, |a, (_, v)| a + *v);
+
+        // Act
+        let (first, carry) = split(Bytes::new(0, 100), &[(d.clone(), Bytes::new(0, 120))], Bytes::ZERO, false);
+        let (second, after) = split(Bytes::new(0, 200), &[(d, Bytes::new(0, 150))], carry, false);
+
+        // Assert: each connection keeps what it carried, and the two together are the core's.
+        assert_eq!(carry, Bytes::new(0, 20));
+        assert_eq!(first.dims[&DimKey::new(DimKind::Outbound, "HK", "proxy")], Bytes::new(0, 120));
+        assert_eq!(second.dims[&DimKey::new(DimKind::Outbound, "", "")], Bytes::new(0, 30));
+        assert_eq!(after, Bytes::ZERO);
+        assert_eq!(outbound(&first) + outbound(&second), Bytes::new(0, 300));
+    }
+
+    #[test]
+    fn what_came_in_during_a_gap_is_backfill() {
+        // Arrange: the first reading after a gap, before any connection could be followed.
+        let total = Bytes::new(5, 500);
+
+        // Act
+        let (resumed, _) = split(total, &[], Bytes::ZERO, true);
+        let (ongoing, _) = split(total, &[], Bytes::ZERO, false);
+
+        // Assert
+        assert_eq!(resumed.dims[&DimKey::new(DimKind::Outbound, "", BACKFILL)], total);
+        assert_eq!(ongoing.dims[&DimKey::new(DimKind::Outbound, "", "")], total);
     }
 
     #[test]

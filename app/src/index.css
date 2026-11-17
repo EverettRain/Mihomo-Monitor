@@ -32,6 +32,7 @@
     --route-proxy: 42 120 214;
     --route-direct: 27 175 122;
     --route-none: 180 180 188;
+    --route-gap: 214 214 220;
     --ok: 24 154 88;
     --ok-soft: 228 246 236;
     --danger: 214 69 69;
@@ -67,6 +68,7 @@
     --route-proxy: 57 135 229;
     --route-direct: 25 158 112;
     --route-none: 98 98 108;
+    --route-gap: 70 70 78;
     --ok: 111 217 155;
     --ok-soft: 28 52 39;
     --danger: 242 139 130;

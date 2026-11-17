@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -168,6 +168,22 @@ CREATE TABLE domain_daily_v7 (
 INSERT INTO domain_daily_v7 SELECT source_id, day, process_dim_id, domain_dim_id, '', up, down FROM domain_daily;
 DROP TABLE domain_daily;
 ALTER TABLE domain_daily_v7 RENAME TO domain_daily;
+";
+
+/// Backfill, traffic counted with no connection read at all, gets a route of its own (`gap`)
+/// apart from what slipped between readings. Before, both sat under the empty outbound key and
+/// route. A bucket whose only outbound row is that one had no connection read in it: the app was
+/// not running, or did not read connections yet; those become backfill. Where a bucket also has
+/// connections, the row stays as slipped: a resumed reading in the same quarter hour is the
+/// smaller part, and there is nothing to tell the two apart by.
+const SCHEMA_V8: &str = "
+UPDATE traffic SET route = 'gap'
+WHERE route = ''
+  AND dim_id IN (SELECT id FROM dims WHERE kind = 'outbound' AND key = '')
+  AND NOT EXISTS (
+      SELECT 1 FROM traffic other JOIN dims d ON d.id = other.dim_id
+      WHERE d.kind = 'outbound' AND d.key <> ''
+        AND other.source_id = traffic.source_id AND other.bucket = traffic.bucket);
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -828,6 +844,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if version < 7 {
         conn.execute_batch(&format!("BEGIN; {SCHEMA_V7} PRAGMA user_version = 7; COMMIT;")).map_err(err)?;
     }
+    if version < 8 {
+        conn.execute_batch(&format!("BEGIN; {SCHEMA_V8} PRAGMA user_version = 8; COMMIT;")).map_err(err)?;
+    }
     Ok(())
 }
 
@@ -905,6 +924,8 @@ mod tests {
             conn.execute("INSERT INTO traffic SELECT 1, 0, id, 0, ?3 FROM dims WHERE kind = ?1 AND key = ?2", params![kind, key, down])
                 .unwrap();
         }
+        // A quarter hour with nothing but the remainder: the app was not reading connections.
+        conn.execute("INSERT INTO traffic SELECT 1, ?1, id, 0, 400 FROM dims WHERE kind = 'outbound' AND key = ''", [B]).unwrap();
         conn.execute_batch(
             "INSERT INTO dims (kind, key) VALUES ('domain', 'a.com');
              INSERT INTO domain_daily SELECT 1, '2026-11-16', p.id, h.id, 0, 805 FROM dims p, dims h
@@ -912,6 +933,7 @@ mod tests {
         )
         .unwrap();
         let all = Range { start: 0, end: B };
+        let both = Range { start: 0, end: 2 * B };
 
         // Act
         let store = Store::init(conn).unwrap();
@@ -928,6 +950,11 @@ mod tests {
         assert!(store.hosts("2026-11-16", "2026-11-16", None, Some(Route::Proxy)).unwrap().is_empty());
         assert_eq!(store.hosts("2026-11-16", "2026-11-16", None, None).unwrap().len(), 1);
         assert_eq!(store.buckets(all, None, None).unwrap(), vec![(0, Bytes::new(0, 905))]);
+        let mut later = store.routes(both, None).unwrap();
+        later.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(later[1], ("direct".into(), Bytes::new(0, 205)));
+        assert_eq!(later[2], ("gap".into(), Bytes::new(0, 400)));
+        assert_eq!(later[0], ("".into(), Bytes::new(0, 100)));
     }
 
     #[test]

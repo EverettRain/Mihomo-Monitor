@@ -10,10 +10,25 @@ export const ROUTE_FILTERS: readonly (readonly [RouteFilter, string])[] = [
   ["direct", "直连"],
 ];
 
-export const ROUTE_LABEL: Record<Route | "", string> = { proxy: "经代理", direct: "直连", "": "未区分" };
+/**
+ * Where traffic went, as recorded: through a proxy, directly, slipped between two readings (no
+ * connection read carried it), or backfill (it came in while nothing was reading).
+ */
+export type RouteKey = Route | "" | "gap";
+
+export const ROUTE_LABEL: Record<RouteKey, string> = { proxy: "经代理", direct: "直连", "": "漏采", gap: "补记" };
+
+/** What the last two mean, for tooltips. */
+export const ROUTE_NOTE =
+  "漏采：读取期间，在两次读取之间开了又关的连接，看不出去向。补记：Mihomo-Monitor 没在读取时（未运行、断开或开始按连接统计之前）内核走过的流量，恢复读取时从计数补回，没有任何明细。";
 
 /** Fill of each route in the breakdown bars; the empty route is traffic whose route is unknown. */
-export const ROUTE_FILL: Record<Route | "", string> = { proxy: "bg-route-proxy", direct: "bg-route-direct", "": "bg-route-none" };
+export const ROUTE_FILL: Record<RouteKey, string> = {
+  proxy: "bg-route-proxy",
+  direct: "bg-route-direct",
+  "": "bg-route-none",
+  gap: "bg-route-gap",
+};
 
 const KEY = "mihomo-monitor.route";
 

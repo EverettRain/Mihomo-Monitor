@@ -85,12 +85,11 @@ export interface RankRow extends Bytes {
   /** The key is a host group's name. */
   group?: boolean;
   /**
-   * Traffic the core counted that no connection read accounts for (key empty). Only processes list
-   * it apart; their plain empty key is traffic of connections the core named no process for.
+   * Set on rows of traffic no key accounts for (key empty), and why: `unseen` slipped between two
+   * readings, `backfill` came in while nothing was reading (or before connections were read at
+   * all), `unrouted` is one route's traffic recorded before this dimension kept routes.
    */
-  uncollected?: boolean;
-  /** In a ranking of one route: that route's traffic recorded, before routes were kept for this dimension, without one. */
-  unrouted?: boolean;
+  remainder?: "unseen" | "backfill" | "unrouted";
   /** Of up + down, what went through a proxy and what went directly; the rest has no known route. */
   proxy: number;
   direct: number;
@@ -217,6 +216,8 @@ export interface Settings {
   weekStartsSunday: boolean;
   autoDiscover: boolean;
   manualSources: ManualSource[];
+  /** How often connections are read, in milliseconds. */
+  sampleMs: number;
 }
 
 export interface AppInfo {
@@ -239,6 +240,7 @@ export const api = {
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   setWeekStartsSunday: (enabled: boolean) => invoke<void>("set_week_starts_sunday", { enabled }),
   setAutoDiscover: (enabled: boolean) => invoke<void>("set_auto_discover", { enabled }),
+  setSampleInterval: (ms: number) => invoke<void>("set_sample_interval", { ms }),
   listSources: () => invoke<Source[]>("list_sources"),
   addManualSource: (name: string, url: string, secret: string) => invoke<void>("add_manual_source", { name, url, secret }),
   removeManualSource: (url: string) => invoke<void>("remove_manual_source", { url }),
@@ -248,6 +250,8 @@ export const api = {
     invoke<PeriodRow[]>("history", { unit, from, to, source, route }),
   /** Traffic of the local days `from` through `to` by route; the empty key is what has none. */
   routes: (from: string, to: string, source: number | null) => invoke<RankRow[]>("routes", { from, to, source }),
+  /** Traffic by route over about the last `minutes` (whole quarter hours). */
+  recentRoutes: (source: number | null, minutes: number) => invoke<RankRow[]>("recent_routes", { source, minutes }),
   ranking: (kind: DimKind, from: string, to: string, source: number | null, route: Route | null) =>
     invoke<RankRow[]>("ranking", { kind, from, to, source, route }),
   hosts: (from: string, to: string, source: number | null, route: Route | null, process: string | null, group: string | null, view: HostView) =>

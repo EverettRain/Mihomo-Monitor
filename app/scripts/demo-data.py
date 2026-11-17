@@ -5,7 +5,8 @@
 
 The app creates the database and the source (by connecting to scripts/fake-mihomo.py once);
 this only adds history to that source, in the app's own 15-minute buckets. The numbers are
-fictional: a daily rhythm, quieter weekends, the odd big download. The last 90 days are also
+fictional: a daily rhythm, quieter weekends, the odd big download, the odd evening the app was
+not running (backfill, without detail). The last 90 days are also
 split by node, subscription, program and inbound, with the hosts of each day, using the names
 fake-mihomo.py uses; older traffic stays unattributed, as for someone who upgraded from a
 version without the split. The container fake-mihomo.py lists without a process is recorded
@@ -112,8 +113,10 @@ def main():
             bucket = ts - ts % BUCKET
             day_up += up
             day_down += down
-            if back >= SPLIT_DAYS:
-                rows.append((source, bucket, unattributed, "", up, down))
+            # Before connections were read, and the odd evening the app was not running: all of
+            # it came as backfill, with no detail.
+            if back >= SPLIT_DAYS or (back % 6 == 3 and 20 <= hour < 22):
+                rows.append((source, bucket, unattributed, "gap", up, down))
                 continue
             seen = 1 - fake.UNSEEN
             rows.append((source, bucket, unattributed, "", int(up * fake.UNSEEN), int(down * fake.UNSEEN)))

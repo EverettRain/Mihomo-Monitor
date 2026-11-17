@@ -29,7 +29,12 @@ const LIVE_SECS: usize = 600;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(60);
 /// How often the open connections are read. Shorter catches more of the last bytes of
 /// connections that close quickly; each read parses the whole connection list.
-const POLL_EVERY: Duration = Duration::from_secs(2);
+/// Consecutive failed readings of a core's connections before reading it is given up and the core
+/// looked for again. A single failure only skips that reading: what it would have counted comes
+/// with the next one.
+const READ_FAILURES: u32 = 3;
+/// How soon the live rate stream is opened again after it broke; accounting goes on meanwhile.
+const RATES_RETRY: Duration = Duration::from_secs(5);
 /// A finished day keeps this many (process, host) pairs, and each process its own biggest few.
 const HOSTS_KEPT: usize = 200;
 const HOSTS_PER_PROCESS: usize = 10;
@@ -209,26 +214,37 @@ pub struct RankRow {
     /// The key is a host group's name rather than a host.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub group: bool,
-    /// Traffic the core counted that no connection read accounts for (key empty). Listed apart
-    /// for processes only, where the empty key itself is traffic of connections without one.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub uncollected: bool,
-    /// In a ranking of one route: traffic of that route recorded, before routes were kept for
-    /// this dimension, without one (key empty).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub unrouted: bool,
+    /// Set on rows of traffic no key of this dimension accounts for (key empty), and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remainder: Option<Remainder>,
     /// Of `up + down`, what went through a proxy and what went directly; the rest has no known
     /// route.
     pub proxy: u64,
     pub direct: u64,
 }
 
-/// A key's traffic, and how much of it went through a proxy or directly.
+/// Why traffic has no key in a ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Remainder {
+    /// Counted by the core while it was being read, but carried by no connection read: those
+    /// that opened and closed between two readings, and the last bytes of others.
+    Unseen,
+    /// Counted when reading resumed after a gap (the app was not running, or had lost the
+    /// core), and everything recorded before connections were read at all.
+    Backfill,
+    /// In a ranking of one route: that route's traffic recorded before this dimension kept
+    /// routes.
+    Unrouted,
+}
+
+/// A key's traffic, and how much of it went through a proxy, directly, or came as backfill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Tally {
     bytes: Bytes,
     proxy: u64,
     direct: u64,
+    backfill: Bytes,
 }
 
 impl Tally {
@@ -237,22 +253,24 @@ impl Tally {
         match route {
             "proxy" => self.proxy += b.up + b.down,
             "direct" => self.direct += b.up + b.down,
+            split::BACKFILL => self.backfill += b,
             _ => {}
         }
     }
 
-    fn row(self, key: String) -> RankRow {
-        RankRow {
-            key,
-            up: self.bytes.up,
-            down: self.bytes.down,
-            group: false,
-            uncollected: false,
-            unrouted: false,
-            proxy: self.proxy,
-            direct: self.direct,
-        }
+    fn of(route: &str, b: Bytes) -> Tally {
+        let mut t = Tally::default();
+        t.add(route, b);
+        t
     }
+
+    fn row(self, key: String) -> RankRow {
+        RankRow { key, up: self.bytes.up, down: self.bytes.down, group: false, remainder: None, proxy: self.proxy, direct: self.direct }
+    }
+}
+
+fn minus(a: Bytes, b: Bytes) -> Bytes {
+    Bytes::new(a.up.saturating_sub(b.up), a.down.saturating_sub(b.down))
 }
 
 /// Whether a row of route `row` is wanted when asking for `route`, or for all traffic.
@@ -272,12 +290,7 @@ fn ranked_marked(map: HashMap<(String, bool), Tally>) -> Vec<RankRow> {
 }
 
 fn sort_rows(rows: &mut [RankRow]) {
-    rows.sort_by(|a, b| {
-        (b.up + b.down)
-            .cmp(&(a.up + a.down))
-            .then_with(|| a.key.cmp(&b.key))
-            .then((a.uncollected, a.unrouted).cmp(&(b.uncollected, b.unrouted)))
-    });
+    rows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then_with(|| a.key.cmp(&b.key)).then(a.remainder.cmp(&b.remainder)));
 }
 
 /// How hosts are listed.
@@ -359,6 +372,9 @@ struct State {
     pending: BTreeMap<(i64, i64, DimKey), Bytes>,
     /// Host traffic not yet in the database, per (source, local day, process, host and route).
     pending_hosts: BTreeMap<(i64, String, HostKey), Bytes>,
+    /// Per source, what its connections carried beyond the core's total so far, to come off
+    /// the next remainder (see `split::split`).
+    carry: HashMap<i64, Bytes>,
     /// Finished days before this one have had their hosts cut down to the top ones.
     hosts_pruned_before: String,
     /// Latest counters accounted for, per source; written with `pending`.
@@ -385,6 +401,8 @@ pub struct Monitor {
     matcher: Mutex<Option<Arc<Matcher>>>,
     /// The enabled attribution rules, read once and kept until they change.
     attributor: Mutex<Option<Arc<Attributor>>>,
+    /// How often connections are read, in milliseconds; a change applies from the next reading.
+    sample_ms: std::sync::atomic::AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -417,6 +435,7 @@ impl Monitor {
             wake: Notify::new(),
             matcher: Mutex::new(None),
             attributor: Mutex::new(None),
+            sample_ms: std::sync::atomic::AtomicU64::new(settings::sample_ms(0)),
         })
     }
 
@@ -528,6 +547,10 @@ impl Monitor {
 
     async fn collect(self: Arc<Self>, f: Found, id: i64) {
         let result = self.read(&f, id).await;
+        if let Err(e) = &result {
+            // Each stop starts the next reading over: what passes until then comes as backfill.
+            paths::log(&format!("停止读取「{}」：{e}", f.name));
+        }
         {
             let mut st = lock(&self.state);
             st.running.remove(&f.key);
@@ -540,12 +563,38 @@ impl Monitor {
         self.wake.notify_one();
     }
 
-    /// Reads a core until it fails or is no longer wanted: rates and accounting side by side.
+    pub fn set_sample_interval(&self, ms: u64) {
+        self.sample_ms.store(settings::sample_ms(ms), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn sample_every(&self) -> Duration {
+        Duration::from_millis(self.sample_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Reads a core until accounting fails or the core is no longer wanted. The live rates run
+    /// beside it and reconnect on their own: losing them must not cost the accounting its place.
     async fn read(&self, f: &Found, id: i64) -> Result<(), String> {
         let client = Client::new(&f.endpoint).map_err(|e| e.to_string())?;
         tokio::select! {
-            r = self.read_rates(&client, f, id) => r,
             r = self.read_connections(&client, f, id) => r,
+            () = self.keep_reading_rates(&client, f, id) => Ok(()),
+        }
+    }
+
+    /// Returns only when the source is no longer wanted.
+    async fn keep_reading_rates(&self, client: &Client, f: &Found, id: i64) {
+        let mut failing = false;
+        loop {
+            match self.read_rates(client, f, id).await {
+                Ok(()) => return,
+                Err(e) => {
+                    if !failing {
+                        paths::log(&format!("「{}」的实时速率中断，{} 秒后重连：{e}", f.name, RATES_RETRY.as_secs()));
+                    }
+                    failing = true;
+                }
+            }
+            tokio::time::sleep(RATES_RETRY).await;
         }
     }
 
@@ -563,14 +612,30 @@ impl Monitor {
         let mut prev: Option<Bytes> = None;
         let mut tracker = Tracker::default();
         let mut profiles = (f.key == discovery::Client::Verge.key()).then(verge::Profiles::default);
-        let mut tick = tokio::time::interval(POLL_EVERY);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut reports_due = tokio::time::Instant::now();
         let mut types = OutboundTypes::new();
         let mut types_read: Option<tokio::time::Instant> = None;
+        let mut next = tokio::time::Instant::now();
+        let mut failures = 0;
         loop {
-            tick.tick().await;
-            let snap = client.connections().await.map_err(|e| e.to_string())?;
+            tokio::time::sleep_until(next).await;
+            let period = self.sample_every();
+            // After a slow reading, carry on from now rather than catching up in a burst.
+            next = (next + period).max(tokio::time::Instant::now());
+            let snap = match client.connections().await {
+                Ok(snap) => snap,
+                Err(e) => {
+                    failures += 1;
+                    if failures >= READ_FAILURES {
+                        return Err(e.to_string());
+                    }
+                    continue;
+                }
+            };
+            if failures > 0 || prev.is_none() {
+                self.set_status(&f.key, Status::Online, None);
+            }
+            failures = 0;
             let now = tokio::time::Instant::now();
             if now >= reports_due {
                 reports_due += REPORTS_EVERY;
@@ -638,8 +703,12 @@ impl Monitor {
             Some(p) => counter::step(p, totals),
             None => counter::resume(st.checkpoints.get(&id).or(saved.as_ref()), core, totals),
         };
+        // A new reading session, or a core that restarted, owes nothing from before.
+        let restarted = prev.is_some_and(|p| totals.up < p.up || totals.down < p.down);
+        let carry = if prev.is_none() || restarted { Bytes::ZERO } else { st.carry.get(&id).copied().unwrap_or_default() };
         if !delta.is_zero() || !conns.is_empty() {
-            let s = split::split(delta, conns);
+            let (s, left) = split::split(delta, conns, carry, prev.is_none());
+            st.carry.insert(id, left);
             let bucket = bucket_of(now);
             for (k, b) in s.dims {
                 *st.pending.entry((id, bucket, k)).or_default() += b;
@@ -927,35 +996,39 @@ impl Monitor {
     }
 
     /// Traffic per key of one dimension over the local days `from` through `to`, biggest first.
-    /// Dimensions other than the outbound one know only part of the traffic (and nothing before
-    /// per-connection collection began); the rest is listed under the empty key. For processes
-    /// the rest is a row of its own, marked `uncollected`, and the empty key is only the traffic
-    /// of connections the core named no process for and no rule matched.
+    /// Dimensions other than the outbound one know only the traffic of connections read; what
+    /// the core counted beyond that is listed as remainder rows: what slipped between readings,
+    /// and backfill. Within one route nothing slips by (what no connection carried has no
+    /// route), so the remainder there is only rows written before this dimension kept routes.
     pub fn ranking(&self, kind: DimKind, from: Date, to: Date, source: Option<i64>, route: Option<Route>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
         let mut map = self.kind_sums(kind, range, source, route)?;
+        let mut extra: Vec<(Remainder, Tally)> = Vec::new();
         if kind == DimKind::Outbound {
-            return Ok(ranked(map));
-        }
-        let total = Prefix::new(self.buckets(range, source, route)?).sum(range);
-        let known = map.values().fold(Bytes::ZERO, |a, t| a + t.bytes);
-        let rest = Bytes::new(total.up.saturating_sub(known.up), total.down.saturating_sub(known.down));
-        // Within one route, everything was carried by connections read (what none accounts for
-        // has no route), so what is missing is rows written without a route: before routes
-        // were kept for this dimension.
-        let (uncollected, unrouted) = (route.is_none() && kind == DimKind::Process, route.is_some());
-        if !(uncollected || unrouted) {
-            map.entry(String::new()).or_default().add("", rest);
-            return Ok(ranked(map));
+            // Its empty key holds both remainders, told apart by route.
+            if let Some(t) = map.remove("") {
+                extra.push((Remainder::Backfill, Tally::of(split::BACKFILL, t.backfill)));
+                extra.push((Remainder::Unseen, Tally::of("", minus(t.bytes, t.backfill))));
+            }
+        } else {
+            let total = Prefix::new(self.buckets(range, source, route)?).sum(range);
+            let known = map.values().fold(Bytes::ZERO, |a, t| a + t.bytes);
+            let rest = minus(total, known);
+            match route {
+                Some(r) => extra.push((Remainder::Unrouted, Tally::of(r.key(), rest))),
+                None => {
+                    let backfill = self.route_tallies(range, source)?.get(split::BACKFILL).map(|t| t.bytes).unwrap_or_default();
+                    let backfill = Bytes::new(backfill.up.min(rest.up), backfill.down.min(rest.down));
+                    extra.push((Remainder::Backfill, Tally::of(split::BACKFILL, backfill)));
+                    extra.push((Remainder::Unseen, Tally::of("", minus(rest, backfill))));
+                }
+            }
         }
         let mut rows = ranked(map);
-        if !rest.is_zero() {
-            // Within one route the rest is that route's traffic, only not split by this dimension.
-            let mut t = Tally::default();
-            t.add(route.map_or("", Route::key), rest);
-            rows.push(RankRow { uncollected, unrouted, ..t.row(String::new()) });
-            sort_rows(&mut rows);
-        }
+        rows.extend(
+            extra.into_iter().filter(|(_, t)| !t.bytes.is_zero()).map(|(why, t)| RankRow { remainder: Some(why), ..t.row(String::new()) }),
+        );
+        sort_rows(&mut rows);
         Ok(rows)
     }
 
@@ -978,6 +1051,17 @@ impl Monitor {
     /// key for what has none. Together they are all the traffic.
     pub fn routes(&self, from: Date, to: Date, source: Option<i64>) -> Result<Vec<RankRow>, String> {
         let Some(range) = self.days_range(from, to)? else { return Ok(Vec::new()) };
+        Ok(ranked(self.route_tallies(range, source)?))
+    }
+
+    /// Traffic by route over the last `minutes` (whole 15-minute buckets, the one now included),
+    /// to show how much of what is going on now the connections account for.
+    pub fn recent_routes(&self, source: Option<i64>, minutes: i64, now: i64) -> Result<Vec<RankRow>, String> {
+        let range = Range { start: bucket_of(now - minutes * 60), end: now + 1 };
+        Ok(ranked(self.route_tallies(range, source)?))
+    }
+
+    fn route_tallies(&self, range: Range, source: Option<i64>) -> Result<HashMap<String, Tally>, String> {
         let mut map: HashMap<String, Tally> = HashMap::new();
         for (route, b) in lock(&self.store).routes(range, source)? {
             map.entry(route.clone()).or_default().add(&route, b);
@@ -987,7 +1071,7 @@ impl Monitor {
                 map.entry(k.route.clone()).or_default().add(&k.route, *b);
             }
         }
-        Ok(ranked(map))
+        Ok(map)
     }
 
     /// Every subscription known — seen in traffic, reported by a client or core, or given a
@@ -1123,6 +1207,7 @@ impl Monitor {
                 bytes: a.bytes + Bytes::new(r.up, r.down),
                 proxy: a.proxy + r.proxy,
                 direct: a.direct + r.direct,
+                backfill: a.backfill,
             });
             match all.iter_mut().find(|r| r.key.is_empty() && !r.group) {
                 Some(r) => {
@@ -1456,6 +1541,41 @@ mod tests {
     }
 
     #[test]
+    fn backfill_and_what_slipped_between_readings_are_listed_apart() {
+        // Arrange: reading starts, stops; 500 bytes pass unread; reading resumes, and of the
+        // next 500 the connections read account for 300.
+        let (m, id) = monitor_with_source();
+        let at = noon().timestamp().as_second();
+        let chrome = Dims {
+            outbound: "HK 01".into(),
+            route: Route::Proxy.key().into(),
+            subscription: "白月光".into(),
+            process: "Chrome".into(),
+            inbound: "DEFAULT-MIXED".into(),
+            host: "www.youtube.com".into(),
+        };
+        m.account("a", id, None, None, Bytes::ZERO, &[], at);
+        m.account("a", id, None, None, Bytes::new(0, 500), &[], at + 600);
+        m.account("a", id, None, Some(Bytes::new(0, 500)), Bytes::new(0, 1_000), &[(chrome, Bytes::new(0, 300))], at + 602);
+        let today = jiff::Timestamp::from_second(at).unwrap().to_zoned_datetime(TimeZone::system()).date();
+        let rank = |kind| -> Vec<(String, u64, Option<Remainder>)> {
+            m.ranking(kind, today, today, Some(id), None).unwrap().into_iter().map(|r| (r.key, r.down, r.remainder)).collect()
+        };
+
+        // Act
+        let (outbound, process) = (rank(DimKind::Outbound), rank(DimKind::Process));
+        let routes: Vec<(String, u64)> = m.routes(today, today, Some(id)).unwrap().into_iter().map(|r| (r.key, r.down)).collect();
+
+        // Assert
+        let expect = |key: &str| {
+            vec![("".into(), 500, Some(Remainder::Backfill)), (key.into(), 300, None), ("".into(), 200, Some(Remainder::Unseen))]
+        };
+        assert_eq!(outbound, expect("HK 01"));
+        assert_eq!(process, expect("Chrome"));
+        assert_eq!(routes, vec![("gap".into(), 500), ("proxy".into(), 300), ("".into(), 200)]);
+    }
+
+    #[test]
     fn rows_without_a_route_are_listed_apart_when_one_route_is_shown() {
         // Arrange: proxied traffic whose process rows were written before routes were kept,
         // and newer proxied traffic of curl.
@@ -1488,7 +1608,7 @@ mod tests {
 
         // Assert
         assert_eq!(
-            proxied.iter().map(|r| (r.key.as_str(), r.down, r.unrouted)).collect::<Vec<_>>(),
+            proxied.iter().map(|r| (r.key.as_str(), r.down, r.remainder == Some(Remainder::Unrouted))).collect::<Vec<_>>(),
             [("", 300, true), ("curl", 200, false)]
         );
         assert_eq!(all.iter().map(|r| (r.key.as_str(), r.down)).collect::<Vec<_>>(), [("Chrome", 300), ("curl", 200)]);
@@ -1543,7 +1663,7 @@ mod tests {
 
         // Assert
         assert_eq!(
-            process.iter().map(|r| (r.key.as_str(), r.down, r.uncollected)).collect::<Vec<_>>(),
+            process.iter().map(|r| (r.key.as_str(), r.down, r.remainder == Some(Remainder::Unseen))).collect::<Vec<_>>(),
             [("", 300, false), ("Container: us-workstation", 300, false), ("", 200, true), ("curl", 200, false)]
         );
         let sum = |rows: &[RankRow]| rows.iter().map(|r| r.down).sum::<u64>();

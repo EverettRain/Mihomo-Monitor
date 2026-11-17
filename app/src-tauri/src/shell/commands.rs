@@ -54,6 +54,7 @@ pub struct SettingsView {
     week_starts_sunday: bool,
     auto_discover: bool,
     manual_sources: Vec<ManualSource>,
+    sample_ms: u64,
 }
 
 #[tauri::command]
@@ -64,6 +65,7 @@ pub fn get_settings(app: AppHandle) -> SettingsView {
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         week_starts_sunday: s.week_starts_sunday,
         auto_discover: s.auto_discover,
+        sample_ms: settings::sample_ms(s.sample_ms),
         manual_sources: s.manual_sources,
     }
 }
@@ -84,6 +86,14 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn set_week_starts_sunday(enabled: bool) -> Result<(), String> {
     settings::update(|s| s.week_starts_sunday = enabled).map(|_| ())
+}
+
+#[tauri::command]
+pub fn set_sample_interval(monitor: Mon, ms: u64) -> Result<(), String> {
+    let ms = settings::sample_ms(ms);
+    settings::update(|s| s.sample_ms = ms)?;
+    monitor.set_sample_interval(ms);
+    Ok(())
 }
 
 #[tauri::command]
@@ -148,6 +158,12 @@ pub fn ranking(
     route: Option<Route>,
 ) -> Result<Vec<RankRow>, String> {
     monitor.ranking(kind, date(&from)?, date(&to)?, source, route)
+}
+
+/// Traffic by route over the last `minutes`.
+#[tauri::command]
+pub fn recent_routes(monitor: Mon, source: Option<i64>, minutes: i64) -> Result<Vec<RankRow>, String> {
+    monitor.recent_routes(source, minutes.clamp(15, 24 * 60), paths::now_secs())
 }
 
 #[tauri::command]

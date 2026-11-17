@@ -95,6 +95,7 @@ pub fn run(start_in_tray: bool) {
             commands::set_autostart,
             commands::set_week_starts_sunday,
             commands::set_auto_discover,
+            commands::set_sample_interval,
             commands::list_sources,
             commands::add_manual_source,
             commands::remove_manual_source,
@@ -103,6 +104,7 @@ pub fn run(start_in_tray: bool) {
             commands::history,
             commands::ranking,
             commands::routes,
+            commands::recent_routes,
             commands::hosts,
             commands::data_bounds,
             commands::top_days,
@@ -134,6 +136,7 @@ pub fn run(start_in_tray: bool) {
             let handle = app.handle().clone();
             let store = Store::open(&paths::database_path()).inspect_err(|e| paths::log(e))?;
             let monitor = Monitor::new(store, sink(handle.clone()));
+            monitor.set_sample_interval(settings::load().sample_ms);
             app.manage(monitor.clone());
             tray::build(&handle)?;
             first_launch_autostart(&handle);

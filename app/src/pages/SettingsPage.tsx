@@ -2,10 +2,17 @@ import { listen } from "@tauri-apps/api/event";
 import { BellRing, FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Group, Page, Row } from "@/components/PageHeader";
+import { Segmented } from "@/components/Segmented";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { api, errorText, type AppInfo, type Settings } from "@/lib/api";
+
+const SAMPLE_CHOICES: readonly (readonly [number, string])[] = [
+  [500, "0.5 秒"],
+  [1000, "1 秒"],
+  [2000, "2 秒"],
+];
 
 export function SettingsPage({ info }: { info: AppInfo | null }) {
   const toast = useToast();
@@ -68,6 +75,17 @@ export function SettingsPage({ info }: { info: AppInfo | null }) {
               checked={settings?.weekStartsSunday ?? false}
               disabled={!settings}
               onCheckedChange={(v) => void change(() => api.setWeekStartsSunday(v), { weekStartsSunday: v })}
+            />
+          </Row>
+          <Row
+            label="采样间隔"
+            hint="多久读一次各内核的连接列表。间隔越短，两次读取之间开了又关、看不出去向的连接（漏采）越少；每次读取约占 1 毫秒 / 千条连接。修改后立即生效。"
+          >
+            <Segmented
+              label="采样间隔"
+              value={settings?.sampleMs ?? 1000}
+              onChange={(ms) => void change(() => api.setSampleInterval(ms), { sampleMs: ms })}
+              options={SAMPLE_CHOICES}
             />
           </Row>
         </Group>
