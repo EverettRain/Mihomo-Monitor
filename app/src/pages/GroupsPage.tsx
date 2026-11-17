@@ -1,7 +1,7 @@
 import { Download, FolderPlus, Loader2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ImportDialog } from "@/components/ImportDialog";
-import { Page, PageHeader } from "@/components/PageHeader";
+import { Group, Page, PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
@@ -84,7 +84,7 @@ function RuleRow({ rule, onChanged }: { rule: HostRule; onChanged: () => void })
     }
   };
   return (
-    <div className="group flex items-center gap-2 px-3 py-1">
+    <div className="group flex items-center gap-2 px-3 py-1.5">
       <Select aria-label="匹配方式" value={rule.kind} onChange={(e) => void save(e.target.value as RuleKind, value)} className="h-7 w-[118px] shrink-0 bg-transparent text-[12px]">
         {KINDS.map((k) => (
           <option key={k} value={k}>
@@ -155,68 +155,65 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
   }, [group.rules, filter]);
 
   return (
-    <section className="list-card min-w-0">
-      <div className="flex items-start gap-3 px-4 py-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[14px] font-semibold">{group.name}</div>
-          <div className="truncate text-[11.5px] text-muted">{group.note || `${group.rules.length} 条`}</div>
+    <div className="space-y-5">
+      <Group
+        label={<span className="normal-case">{group.name}</span>}
+        action={
+          <div className="flex items-center gap-1">
+            <Button size="sm" variant="ghost" onClick={onImport}>
+              <Upload />
+              导入到此分组
+            </Button>
+            <Button size="sm" variant="ghost" onClick={onEdit}>
+              <Pencil />
+              编辑
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setConfirmDelete(true)}>
+              <Trash2 />
+              删除
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-2 px-4 py-3">
+          {group.note && <p className="text-[12.5px] text-muted">{group.note}</p>}
+          <Textarea
+            aria-label="添加条目"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) void add();
+            }}
+            placeholder={"添加条目，每行一条，例如：\nyoutube.com\n91.108.4.0/22"}
+            className="min-h-[76px] font-mono"
+          />
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-[11.5px] leading-[17px] text-muted">不带前缀的域名包括子域名，写 DOMAIN,域名 则仅此域名。⌘/Ctrl + 回车添加。</p>
+            <Button size="sm" disabled={busy || !text.trim()} onClick={() => void add()}>
+              {busy ? <Loader2 className="animate-spin" /> : <Plus />}
+              添加
+            </Button>
+          </div>
         </div>
-        <Button size="sm" variant="outline" onClick={onImport}>
-          <Upload />
-          导入到此分组
-        </Button>
-        <Button size="iconSm" variant="ghost" aria-label="编辑分组" title="改名或备注" onClick={onEdit}>
-          <Pencil />
-        </Button>
-        <Button size="iconSm" variant="ghost" aria-label="删除分组" title="删除分组" onClick={() => setConfirmDelete(true)}>
-          <Trash2 />
-        </Button>
-      </div>
+      </Group>
 
-      <div className="space-y-2 px-4 py-3">
-        <Textarea
-          aria-label="添加条目"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) void add();
-          }}
-          placeholder={"每行一条，例如：\nyoutube.com\n91.108.4.0/22"}
-          className="min-h-[76px] font-mono"
-        />
-        <div className="flex items-center justify-between gap-3">
-          <p className="text-[11.5px] leading-[17px] text-muted">
-            不带前缀的域名包括子域名，写 DOMAIN,域名 则仅此域名。⌘/Ctrl + 回车添加。
-          </p>
-          <Button size="sm" disabled={busy || !text.trim()} onClick={() => void add()}>
-            {busy ? <Loader2 className="animate-spin" /> : <Plus />}
-            添加
-          </Button>
-        </div>
-      </div>
-
-      <div className="pb-2">
-        <div className="flex items-center gap-2 px-4 pb-1 pt-3">
-          <span className="text-[12px] text-muted">
-            共 {group.rules.length} 条{filter && `，显示 ${shown.length} 条`}
-          </span>
-          {group.rules.length > 8 && (
-            <div className="relative ml-auto w-[180px]">
+      <Group
+        label={`条目（${filter ? `${shown.length} / ` : ""}${group.rules.length}）`}
+        action={
+          group.rules.length > 8 && (
+            <div className="relative w-[180px]">
               <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted" />
               <Input aria-label="筛选条目" placeholder="筛选" value={filter} onChange={(e) => setFilter(e.target.value)} className="h-7 pl-7 text-[12px]" />
             </div>
-          )}
-        </div>
+          )
+        }
+      >
         {group.rules.length === 0 ? (
-          <p className="px-4 py-6 text-center text-[12px] text-muted">还没有条目，在上面添加或导入。</p>
+          <p className="px-4 py-3 text-[12.5px] text-muted">还没有条目，在上面添加或导入。</p>
         ) : (
-          <div className="max-h-[420px] overflow-y-auto">
-            {shown.map((r) => (
-              <RuleRow key={r.id} rule={r} onChanged={onChanged} />
-            ))}
-          </div>
+          shown.map((r) => <RuleRow key={r.id} rule={r} onChanged={onChanged} />)
         )}
-      </div>
+      </Group>
 
       <Dialog
         open={confirmDelete}
@@ -240,7 +237,7 @@ function GroupDetail({ group, onChanged, onEdit, onImport }: { group: HostGroup;
           </>
         }
       />
-    </section>
+    </div>
   );
 }
 
@@ -318,30 +315,35 @@ export function GroupsPage() {
             </div>
           </div>
         ) : (
-          <div className="grid grid-cols-[200px_minmax(0,1fr)] items-start gap-4">
-            <nav aria-label="分组" className="list-card py-1">
-              {groups.map((g) => (
-                <button
-                  key={g.id}
-                  onClick={() => setSelected(g.id)}
-                  aria-current={g.id === selected ? "true" : undefined}
-                  className={cn(
-                    "flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[12.5px] active:!scale-100",
-                    g.id === selected ? "bg-pill font-medium text-fg" : "text-fg-2 hover:bg-pill/60",
-                  )}
-                >
-                  <span className="truncate">{g.name}</span>
-                  <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted">{g.rules.length}</span>
-                </button>
-              ))}
-            </nav>
+          <div className="space-y-3">
+            <div className="rounded-xl bg-card p-3 shadow-card">
+              <div role="tablist" aria-label="分组" className="flex gap-0.5 overflow-x-auto rounded-lg bg-pill p-0.5">
+                {groups.map((g) => (
+                  <button
+                    key={g.id}
+                    role="tab"
+                    aria-selected={g.id === selected}
+                    onClick={() => setSelected(g.id)}
+                    className={cn(
+                      "flex h-7 min-w-[72px] shrink-0 flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-[12.5px] active:!scale-100",
+                      g.id === selected ? "bg-card font-medium text-fg shadow-edge dark:bg-white/[.12]" : "text-muted hover:text-fg",
+                    )}
+                  >
+                    {g.name}
+                    <span className="font-mono text-[10.5px] tabular-nums text-faint">{g.rules.length}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
             {current && (
-              <GroupDetail
-                group={current}
-                onChanged={() => void load()}
-                onEdit={() => setEditing({ open: true, group: current })}
-                onImport={() => setImporting({ open: true, preset: current.id })}
-              />
+              <div key={current.id} className="view-in">
+                <GroupDetail
+                  group={current}
+                  onChanged={() => void load()}
+                  onEdit={() => setEditing({ open: true, group: current })}
+                  onImport={() => setImporting({ open: true, preset: current.id })}
+                />
+              </div>
             )}
           </div>
         )}

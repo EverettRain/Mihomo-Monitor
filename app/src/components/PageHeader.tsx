@@ -24,7 +24,7 @@ export function Page({ children }: { children: React.ReactNode }) {
 }
 
 /** A labelled group: small uppercase label above a grouped list card. */
-export function Group({ label, action, children, className }: { label?: string; action?: React.ReactNode; children: React.ReactNode; className?: string }) {
+export function Group({ label, action, children, className }: { label?: React.ReactNode; action?: React.ReactNode; children: React.ReactNode; className?: string }) {
   return (
     <section className={className}>
       {(label || action) && (
