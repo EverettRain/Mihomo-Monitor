@@ -404,6 +404,11 @@ impl Monitor {
                     v.message = Some("已关闭自动发现本机内核".into());
                 }
             }
+            // A core no longer seen at all, and never read, leaves nothing worth listing.
+            let present: HashSet<&str> =
+                d.found.iter().map(|f| f.key.as_str()).chain(d.unreadable.iter().map(|u| u.key.as_str())).collect();
+            let running = st.running.clone();
+            st.sources.retain(|k, v| v.manual || v.id.is_some() || present.contains(k.as_str()) || running.contains(k));
             for u in d.unreadable {
                 if st.running.contains(&u.key) {
                     continue;
@@ -493,7 +498,7 @@ impl Monitor {
     async fn read_connections(&self, client: &Client, f: &Found, id: i64) -> Result<(), String> {
         let mut prev: Option<Bytes> = None;
         let mut tracker = Tracker::default();
-        let mut profiles = (f.key == discovery::VERGE_KEY).then(verge::Profiles::default);
+        let mut profiles = (f.key == discovery::Client::Verge.key()).then(verge::Profiles::default);
         let mut tick = tokio::time::interval(POLL_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut reports_due = tokio::time::Instant::now();

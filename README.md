@@ -75,13 +75,24 @@ Mihomo-Monitor 依次尝试下面几种方式，找到的每个候选都会先�
 | 方式 | 说明 |
 | --- | --- |
 | 读取内核进程的启动参数 | 客户端通常用 `-d`、`-f`、`-ext-ctl-unix`、`-ext-ctl-pipe` 启动内核；Mihomo-Monitor 由此找到控制接口，必要时再读配置文件里的 `external-controller` 与 `secret` |
-| Clash Verge Rev 的已知位置 | 读不到启动参数时（例如 Windows 上以 SYSTEM 运行的服务模式），macOS 检查用户临时目录与服务目录下的 `verge-mihomo*.sock`，Windows 列出以 `verge-mihomo` 开头的命名管道 |
+| 已知客户端的固定位置 | 读不到启动参数时（内核由客户端的服务或助手以 root / SYSTEM 启动），按下表检查各客户端放控制接口的位置 |
 | 常用端口 | 以上都没有结果时，探测 `127.0.0.1` 的 9090 与 9097 端口；设置了 secret 时提示手动添加 |
 | 手动添加 | 在 **内核** 页填写控制地址与 secret，适合路由器上的内核或没有被自动发现的内核 |
 
-unix socket 与 Windows 命名管道不需要 secret（mihomo 不在这两个通道上校验 secret，靠文件权限限制访问），所以本机的 Clash Verge Rev 通常不用做任何设置。只想统计路由器时，可以在 **内核** 页关闭「自动发现本机内核」。
+unix socket 与 Windows 命名管道不需要 secret（mihomo 不在这两个通道上校验 secret，靠文件权限限制访问），所以下表中除 FlClash 外的客户端通常不用做任何设置。只想统计路由器时，可以在 **内核** 页关闭「自动发现本机内核」。
 
-已实测：macOS 上的 Clash Verge Rev 2.5.6（服务模式，mihomo v1.19.31）。其他客户端（Mihomo Party、FlClash、ClashX Meta）与 Windows 上的 Clash Verge Rev 尚未逐一实测，欢迎反馈。
+各客户端的识别方式与控制接口位置（依据各项目 2026 年 11 月的源码）：
+
+| 客户端 | 识别 | macOS 控制接口 | Windows 控制接口 | 实测 |
+| --- | --- | --- | --- | --- |
+| Clash Verge Rev | `verge-mihomo*` 进程 | `$TMPDIR/verge-mihomo.sock`、`/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock` | `verge-mihomo*` 命名管道 | macOS 2.5.6 服务模式 |
+| Clash Party（原 Mihomo Party） | 应用内 `sidecar` 目录里的 `mihomo` / `mihomo-alpha` / `mihomo-smart` | `/tmp/mihomo-party-<uid>-<pid>.sock` | `MihomoParty\mihomo-*` 命名管道 | 未实测 |
+| Sparkle | 应用内 `sidecar` 目录里的 `mihomo` / `mihomo-alpha` | `/tmp/sparkle-mihomo-api*.sock` | `Sparkle\mihomo` 命名管道 | 未实测 |
+| ClashX Meta | `com.metacubex.ClashX.ProxyConfigHelper.meta` 进程 | `/tmp/clashx_meta_*.sock`，或配置里的 HTTP 地址 | — | 未实测 |
+| Clash Nyanpasu | 启动参数里的 `nyanpasu` 目录 | 运行目录配置里的 `external-controller-unix` | 运行目录配置里的 `external-controller-pipe` | 未实测 |
+| FlClash | `FlClashCore` 进程 | 只有 HTTP，见下 | 同左 | 未实测 |
+
+FlClash 关闭了内核的 socket 和命名管道，只有在设置里打开「外部控制器」**并且**设置了密钥时，才在 `127.0.0.1:9090` 开放 HTTP 控制接口。所以 FlClash 需要先在它的设置里打开外部控制器并设置密钥，再在 **内核** 页手动添加 `http://127.0.0.1:9090` 和这个密钥；**内核** 页会对 FlClash 给出相应提示。
 
 ## 历史
 
@@ -231,7 +242,7 @@ app/scripts/readme-screenshots.sh
 ## 路线图
 
 - [x] 托盘常驻、轻量模式、开机自启、自动更新
-- [x] 内核发现（启动参数、配置文件、Clash Verge Rev 已知位置、手动添加）
+- [x] 内核发现（启动参数、配置文件、Clash Verge Rev / Clash Party / Sparkle / ClashX Meta 已知位置、手动添加）
 - [x] 总量统计：日 / 周 / 月 / 年、实时速率、断点续算
 - [x] 历史浏览：小时 / 日 / 周 / 月 / 年、排行、自定义时段、导出 CSV
 - [x] 按节点、订阅、DIRECT、进程、入站、域名拆分

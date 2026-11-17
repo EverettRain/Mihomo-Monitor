@@ -44,16 +44,19 @@
 
 目标是“打开即用”，按下面顺序尝试，每找到一个候选就用 `GET /version` 验证（返回 `{"meta":true,"version":…}` 才算 mihomo）。
 
-1. **进程扫描**（`sysinfo` crate）：匹配进程名 `mihomo*`、`verge-mihomo*`、`clash-meta*`、`FlClashCore` 等；能读到命令行时解析 `-d`、`-f`、`-ext-ctl`、`-ext-ctl-unix`、`-ext-ctl-pipe`、`-secret`，再读配置文件里的 `external-controller*` 与 `secret`。
-   - 限制：Clash Verge Rev 的“服务模式”下内核以 SYSTEM / root 运行，普通用户读不到它的命令行，所以还需要第 2 步。
-2. **已知客户端适配器**：每个客户端一条规则，给出它固定的控制地址和配置文件位置。
+1. **进程扫描**（`sysinfo` crate）：匹配进程名（或可执行文件名）`mihomo`、`mihomo-alpha`、`mihomo-smart`、`verge-mihomo*`、`clash-meta`、`FlClashCore`、`com.metacubex.ClashX.ProxyConfigHelper.meta` 与发布版的 `mihomo-<os>-<arch>-…`；能读到命令行时解析 `-d`、`-f`、`-ext-ctl`、`-ext-ctl-unix`、`-ext-ctl-pipe`、`-secret`，再读配置文件里的 `external-controller*` 与 `secret`。
+   - 限制：Clash Verge Rev 的“服务模式”、ClashX Meta 的助手都以 SYSTEM / root 启动内核，普通用户可能读不到它的命令行，所以还需要第 2 步。
+   - 客户端由进程名、可执行文件路径、`-d` / `-f` 目录与 socket / pipe 路径识别（`infra::discovery::Client`）。认出客户端后，来源的 key 固定为客户端名（如 `clash-party`），控制接口换位置也不影响历史；Clash Party、Sparkle 用的是普通的 `mihomo`，只能靠路径认出。
+2. **已知客户端适配器**：每个客户端一条规则，给出它固定的控制地址。命令行读不到，或某个客户端的内核进程根本看不到时，都按这些位置逐个用 `/version` 试。以下依据各项目 2026-11 的源码：
 
-   | 客户端 | 控制接口 | 状态 |
-   | --- | --- | --- |
-   | Clash Verge Rev | 见下方说明；若开启了 HTTP 控制器（默认 `127.0.0.1:9097`）则读 `clash-verge.yaml` | 已对照源码，旧版路径【待实测】 |
-   | Mihomo Party / Sparkle | 自有 pipe / socket | 【待实测】 |
-   | FlClash | 内核独立进程，默认不开放 external controller，需要用户在设置里打开 | 【待实测】 |
-   | ClashX Meta | `~/.config/clash.meta/config.yaml` 中的 HTTP 地址 | 【待实测】 |
+   | 客户端 | 内核与启动方式 | 控制接口 | 状态 |
+   | --- | --- | --- | --- |
+   | Clash Verge Rev | `verge-mihomo*`，`-ext-ctl-unix` / `-ext-ctl-pipe` | 见下方说明 | macOS 服务模式已实测 |
+   | Clash Party（`mihomo-party-org/clash-party`） | `resources/sidecar/` 下的 `mihomo` / `mihomo-alpha` / `mihomo-smart`，`-ext-ctl-unix` / `-ext-ctl-pipe` | `/tmp/mihomo-party-<uid>-<pid>.sock`（旧版 `/tmp/mihomo-party-<uid>.sock`、`/tmp/mihomo-party.sock`、`-admin.sock`）；`\\.\pipe\MihomoParty\mihomo-{admin,user}-<会话>-<pid>` | 源码 |
+   | Sparkle（`xishang0128/sparkle`） | `resources/sidecar/` 下的 `mihomo` / `mihomo-alpha`，或用户指定的系统内核 | `/tmp/sparkle-mihomo-api.sock`、`-api-noperm.sock`、`/tmp/sparkle-mihomo-external.sock`（系统内核）；`\\.\pipe\Sparkle\mihomo` | 源码 |
+   | ClashX Meta（`meta` 分支） | `com.metacubex.ClashX.ProxyConfigHelper.meta`，由 launchd 以 root 启动，`-d ~/.config/clash.meta -f <配置>` | 配置未写 `external-controller-unix` 时用随机的 `/tmp/clashx_meta_<5 位>.sock`；另有配置里的 HTTP（默认 `127.0.0.1:9090`） | 源码 |
+   | Clash Nyanpasu（经 `nyanpasu-service`） | `mihomo -m -d <运行目录> -f <运行目录>/config-<n>.yaml` | 写进该配置的 `external-controller-unix` / `-pipe`（`core-<n>.sock`），从配置文件读出 | 源码 |
+   | FlClash | `FlClashCore` | 主动清空 `external-controller-unix` / `-pipe`；HTTP `127.0.0.1:9090` 只在用户打开「外部控制器」且设置了密钥时开放。读不到密钥，发现后提示用户手动添加 | 源码 |
 
    **Clash Verge Rev 的控制地址随版本变化，不能写死**。从当前源码（`clash-verge-rev` dev 分支 2026-11-16、`clash-verge-service-ipc` v2.8.1）看，旧版的 `/tmp/verge/verge-mihomo.sock` 已经不用了，而且路径按用户区分：
 
@@ -190,7 +193,7 @@ app/
   src-tauri/src/
     domain/                 纯逻辑：counter（增量、重启与断点续算判断）、period（15 分钟分桶、按时区算日/周/月/年）
     infra/                  对外适配：store（SQLite）、settings、mihomo（API 客户端，TCP / unix socket / named pipe）、
-                            discovery（进程扫描、启动参数与配置解析、Verge 已知位置）、releases（GitHub 更新说明）
+                            discovery（进程扫描、启动参数与配置解析、已知客户端位置）、releases（GitHub 更新说明）
     service/                用例：discover（把候选内核逐个用 /version 验证）、monitor（采集、内存累加、定时落盘、各视图查询）
     shell/                  Tauri：托盘、窗口生命周期（轻量模式）、命令
 ```
@@ -220,7 +223,7 @@ app/
 在装有各客户端的 Windows 与 macOS 上逐项确认，结果补进第 3、4 节：
 
 1. ~~macOS + Verge 2.5.6 服务模式~~ 已确认（第 3 节）；还缺 Windows 上 Verge 的 pipe 名与连接权限，以及 macOS 普通模式。
-2. Mihomo Party / Sparkle、FlClash、ClashX Meta 的控制地址与 secret 位置。
+2. Clash Party / Sparkle、FlClash、ClashX Meta、Clash Nyanpasu 的控制地址已对照源码写进第 3 节，还缺真机确认，特别是 Windows 上 `MihomoParty\…`、`Sparkle\…` 这种带子路径的管道能否由列目录列出。
 3. ~~`chains` 顺序~~ 已确认；`providerChains` 在使用 `proxy-providers` 的配置下的取值还没见过。
 4. 1000 条以上连接时，2 秒间隔读 `/connections` 的 CPU 占用，据此定默认间隔。参考工具每 2 秒读一次，C 实现 RSS 3.2 MB、CPU 0–0.1%，说明这个频率本身不贵；Tauri 版常驻进程预计 20–30 MB，主要是 Tauri 运行时和托盘本身的开销。
 5. ~~服务模式下 Verge 的 `profiles.yaml` 位置与字段~~ 已确认（第 7 节）。
